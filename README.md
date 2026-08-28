@@ -16,6 +16,7 @@ seamonw 的个人博客源码。基于 [Hexo](https://hexo.io/) + [Butterfly](ht
 | 字数与阅读时长 | `hexo-wordcount` |
 | RSS / 站点地图 | `hexo-generator-feed`、`hexo-generator-sitemap` |
 | 部署 | GitHub Actions → GitHub Pages |
+| 评论 | [Giscus](https://giscus.app/zh-CN)，评论存在仓库的 Discussions |
 
 ## 本地开发
 
@@ -100,7 +101,9 @@ git push origin main
 分两个文件，不要去改 `node_modules` 里的主题文件：
 
 - `_config.yml`：站点级配置。站点标题、作者、URL 与 `root`、永久链接格式，以及 `feed` / `sitemap` / `search` / `symbols_count_time` 这些插件的参数
-- `_config.butterfly.yml`：主题级配置。导航菜单、顶部大图与文章封面、配色、深色模式、侧栏卡片、搜索与字数统计开关
+- `_config.butterfly.yml`：主题级配置。导航菜单、顶部大图与文章封面、配色、深色模式、侧栏卡片、搜索、字数统计与评论
+
+评论系统是 Giscus，对应仓库 `seamonw/blog` 的 Discussions（分类 Announcements）。读者用 GitHub 账号登录后即可评论。第一次启用时需要把 [Giscus 应用](https://github.com/apps/giscus) 安装到这个仓库，否则评论框会提示仓库未授权。
 
 Hexo 会把 `_config.butterfly.yml` 深合并到主题自带的 `_config.yml` 之上，所以这个文件只需要写要覆盖的项。
 

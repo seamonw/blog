@@ -244,9 +244,28 @@ busuanzi:
   site_pv: false
   page_pv: false
 
-# 暂不开启分享和评论
+# 暂不开启分享
 share:
   use:
 
+# 评论用 Giscus，数据存在仓库 Discussions 里
+# 首次使用需在 https://github.com/apps/giscus 安装到 seamonw/blog
 comments:
-  use:
+  use: Giscus
+  text: true
+  lazyload: true
+  count: false
+  card_post_count: false
+
+giscus:
+  repo: seamonw/blog
+  repo_id: R_kgDOHYjHQw
+  category_id: DIC_kwDOHYjHQ84DEYBW
+  light_theme: light
+  dark_theme: dark
+  option:
+    data-lang: zh-CN
+    data-mapping: pathname
+    data-strict: '1'
+    data-reactions-enabled: '1'
+    data-input-position: top

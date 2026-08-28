@@ -33,26 +33,26 @@ avatar:
 
 disable_top_img: false
 
-# 顶部大图走在线随机图源，每次刷新换一张
-default_top_img: https://picsum.photos/1920/1080
-index_img: https://picsum.photos/1920/1080
-archive_img: https://picsum.photos/1920/1080
-tag_img: https://picsum.photos/1920/1080
-category_img: https://picsum.photos/1920/1080
-footer_img: https://picsum.photos/1920/600
+# 顶部大图走 LoremFlickr 的小动物图源，每次刷新换一张
+default_top_img: https://loremflickr.com/1280/720/kitten,puppy,rabbit,hamster
+index_img: https://loremflickr.com/1280/720/kitten,puppy
+archive_img: https://loremflickr.com/1280/720/rabbit,hamster
+tag_img: https://loremflickr.com/1280/720/squirrel,hedgehog
+category_img: https://loremflickr.com/1280/720/duckling,chick
+footer_img: https://loremflickr.com/1280/720/corgi,kitten
 
 cover:
   index_enable: true
   aside_enable: true
   archives_enable: true
-  # 文章没设置 cover 时，从下面这组图里随机取一张
+  # 文章没设置 cover 时，从下面这组小动物图里随机取一张
   default_cover:
-    - https://picsum.photos/seed/butterfly1/1200/600
-    - https://picsum.photos/seed/butterfly2/1200/600
-    - https://picsum.photos/seed/butterfly3/1200/600
-    - https://picsum.photos/seed/butterfly4/1200/600
-    - https://picsum.photos/seed/butterfly5/1200/600
-    - https://picsum.photos/seed/butterfly6/1200/600
+    - https://loremflickr.com/1200/600/kitten
+    - https://loremflickr.com/1200/600/puppy
+    - https://loremflickr.com/1200/600/rabbit
+    - https://loremflickr.com/1200/600/hamster
+    - https://loremflickr.com/1200/600/squirrel
+    - https://loremflickr.com/1200/600/hedgehog
 
 # --------------------------------------
 # 首页

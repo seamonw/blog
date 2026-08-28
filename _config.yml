@@ -98,7 +98,8 @@ ignore:
 # Extensions
 ## Plugins: https://hexo.io/plugins/
 ## Themes: https://hexo.io/themes/
-theme: next 
+theme: butterfly
+## 主题配置在根目录的 _config.butterfly.yml 中覆盖，不改 node_modules 里的文件
 
 # RSS
 feed:

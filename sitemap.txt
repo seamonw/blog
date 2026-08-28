@@ -1,0 +1,10 @@
+http://example.com/2023/05/06/hexo-blog-%E8%BF%81%E7%A7%BB%E5%88%B0%E5%85%B6%E4%BB%96%E7%94%B5%E8%84%91/
+http://example.com/2022/07/02/ECS/
+http://example.com/categories/index.html
+http://example.com/tags/index.html
+http://example.com/2022/07/02/markdown_synctax/
+http://example.com/
+http://example.com/tags/MarkDown-syntax/
+http://example.com/tags/ecs/
+http://example.com/categories/MarkDown/
+http://example.com/categories/ECS/

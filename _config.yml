@@ -13,8 +13,8 @@ timezone: Asia/Shanghai
 
 # URL
 ## Set your site url here. For example, if you use GitHub Page, set url as 'https://username.github.io/project'
-url: https://seamonw.github.io/xiaohuangli.github.io
-root: /xiaohuangli.github.io/
+url: https://seamonw.github.io/blog
+root: /blog/
 permalink: :year/:month/:day/:title/
 permalink_defaults:
 pretty_urls:
@@ -105,5 +105,5 @@ theme: next
 ## 站点通过 GitHub Actions 自动构建并发布到 GitHub Pages，勿在此写入 Token。
 # deploy:
 #   type: git
-#   repo: https://github.com/seamonw/xiaohuangli.github.io.git
+#   repo: https://github.com/seamonw/blog.git
 #   branch: gh-pages

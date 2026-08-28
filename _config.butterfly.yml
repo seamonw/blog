@@ -33,26 +33,29 @@ avatar:
 
 disable_top_img: false
 
-# 顶部大图走 LoremFlickr 的小动物图源，每次刷新换一张
-default_top_img: https://loremflickr.com/1280/720/kitten,puppy,rabbit,hamster
-index_img: https://loremflickr.com/1280/720/kitten,puppy
-archive_img: https://loremflickr.com/1280/720/rabbit,hamster
-tag_img: https://loremflickr.com/1280/720/squirrel,hedgehog
-category_img: https://loremflickr.com/1280/720/duckling,chick
-footer_img: https://loremflickr.com/1280/720/corgi,kitten
+# 顶部大图走 LoremFlickr 的世界各地风景图源，每次刷新换一张
+# 关键词后加 /all 表示同时命中所有标签，出图更接近风景照
+default_top_img: https://loremflickr.com/1280/720/landscape,mountain/all
+index_img: https://loremflickr.com/1280/720/landscape,lake/all
+archive_img: https://loremflickr.com/1280/720/mountain,alps/all
+tag_img: https://loremflickr.com/1280/720/city,skyline/all
+category_img: https://loremflickr.com/1280/720/desert,canyon/all
+footer_img: https://loremflickr.com/1280/720/ocean,beach/all
 
 cover:
   index_enable: true
   aside_enable: true
   archives_enable: true
-  # 文章没设置 cover 时，从下面这组小动物图里随机取一张
+  # 文章没设置 cover 时，从下面这组各地风景里随机取一张
   default_cover:
-    - https://loremflickr.com/1200/600/kitten
-    - https://loremflickr.com/1200/600/puppy
-    - https://loremflickr.com/1200/600/rabbit
-    - https://loremflickr.com/1200/600/hamster
-    - https://loremflickr.com/1200/600/squirrel
-    - https://loremflickr.com/1200/600/hedgehog
+    - https://loremflickr.com/1200/600/switzerland
+    - https://loremflickr.com/1200/600/iceland
+    - https://loremflickr.com/1200/600/kyoto
+    - https://loremflickr.com/1200/600/santorini
+    - https://loremflickr.com/1200/600/patagonia
+    - https://loremflickr.com/1200/600/newzealand
+    - https://loremflickr.com/1200/600/norway
+    - https://loremflickr.com/1200/600/tuscany
 
 # --------------------------------------
 # 首页

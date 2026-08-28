@@ -87,7 +87,7 @@ Hexo 使用 [GFM](https://github.github.com/gfm/) 风格渲染，和 GitHub 上�
 
 ```markdown
 [Hexo 文档](https://hexo.io/zh-cn/docs/)
-[相对链接](/blog/archives/)
+[相对链接](/archives/)
 ```
 
 [Hexo 文档](https://hexo.io/zh-cn/docs/)
@@ -106,10 +106,10 @@ Hexo 使用 [GFM](https://github.github.com/gfm/) 风格渲染，和 GitHub 上�
 图片语法和链接类似，只是前面多一个 `!`。图片文件建议放在 `source/images/`，正文里用站点根路径引用：
 
 ```markdown
-![迁移时需要复制的文件](/blog/images/blog_mv_file.png)
+![迁移时需要复制的文件](/images/blog_mv_file.png)
 ```
 
-不需要图片说明时，方括号可以留空：`![](/blog/images/blog_mv_file.png)`。
+不需要图片说明时，方括号可以留空：`![](/images/blog_mv_file.png)`。Hexo 会按站点 `root` 补上前缀，部署在 `/blog/` 时实际地址是 `/blog/images/blog_mv_file.png`。
 
 ## 代码
 
@@ -207,6 +207,6 @@ int main() {
 1. 元数据写在文件开头的 YAML 里，至少包含 `title`、`date`，分类和标签按需添加。
 2. 新建文章用 `hexo new "标题"`，文件会出现在 `source/_posts/`。
 3. 本地预览用 `hexo server`，确认无误后再推到 `main`，GitHub Actions 会自动发布。
-4. 站内链接记得带上站点根路径。当前博客部署在子路径下，例如归档页是 `/blog/archives/`，而不是 `/archives/`。
+4. 正文里的站内链接写成 `/archives/`、`/images/...` 这种站点内路径即可，Hexo 会按 `root` 补前缀。当前站点发布后，浏览器里看到的是 `/blog/archives/`。
 
 把结构写清楚，代码和链接补完整，一篇技术笔记通常就够用了。更冷门的扩展语法（脚注、数学公式、图表）可以等真正用到时再加。

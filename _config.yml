@@ -100,6 +100,39 @@ ignore:
 ## Themes: https://hexo.io/themes/
 theme: next 
 
+# RSS
+feed:
+  type: atom
+  path: atom.xml
+  limit: 20
+  hub:
+  content: true
+  content_limit: 140
+  content_limit_delim: ' '
+  order_by: -date
+
+# Sitemap
+sitemap:
+  path: sitemap.xml
+
+# Local search (NexT)
+search:
+  path: search.xml
+  field: post
+  content: true
+  format: html
+
+# Word count / reading time (NexT)
+symbols_count_time:
+  symbols: true
+  time: true
+  total_symbols: true
+  total_time: true
+  exclude_codeblock: false
+  awl: 4
+  wpm: 275
+  suffix: mins.
+
 # Deployment
 ## Docs: https://hexo.io/docs/one-command-deployment
 ## 站点通过 GitHub Actions 自动构建并发布到 GitHub Pages，勿在此写入 Token。

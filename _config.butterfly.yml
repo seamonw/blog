@@ -25,33 +25,33 @@ social:
 # 图片
 # --------------------------------------
 
-favicon: /img/favicon.png?v=2
+favicon: /img/favicon.jpg?v=3
 
 avatar:
-  img: /img/avatar.png?v=2
+  img: /img/avatar.jpg?v=3
   effect: true
 
 disable_top_img: false
 
-# 顶部大图和封面改用本地小动物图，避免 LoremFlickr 在国内加载失败
-default_top_img: /img/covers/banner.jpg
-index_img: /img/covers/banner.jpg
-archive_img: /img/covers/fox.jpg
-tag_img: /img/covers/cat.jpg
-category_img: /img/covers/corgi.jpg
-footer_img: /img/covers/penguin.jpg
+# 全部使用仓库内的世界风景图，避免外部图床加载失败
+default_top_img: /img/scenery/banner.jpg
+index_img: /img/scenery/banner.jpg
+archive_img: /img/scenery/iceland.jpg
+tag_img: /img/scenery/kyoto.jpg
+category_img: /img/scenery/santorini.jpg
+footer_img: /img/scenery/norway.jpg
 
 cover:
   index_enable: true
   aside_enable: true
   archives_enable: true
   default_cover:
-    - /img/covers/fox.jpg
-    - /img/covers/cat.jpg
-    - /img/covers/corgi.jpg
-    - /img/covers/penguin.jpg
-    - /img/covers/redpanda.jpg
-    - /img/covers/bunny.jpg
+    - /img/scenery/iceland.jpg
+    - /img/scenery/kyoto.jpg
+    - /img/scenery/santorini.jpg
+    - /img/scenery/patagonia.jpg
+    - /img/scenery/norway.jpg
+    - /img/scenery/tuscany.jpg
 
 # --------------------------------------
 # 首页

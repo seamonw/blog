@@ -1,26 +1,73 @@
 ---
-title: Go context：从取消信号到实现原理
+title: Go context：创作背景、要解决的问题和源码
 date: 2026-09-02 14:50:00
 categories: Golang
 tags:
 	- golang
 	- context
+	- 源码阅读
 	- 并发
 ---
 
-Goroutine 很容易起，停下来却不容易。一个 HTTP 请求超时了，后面的数据库查询、下游 RPC、还在算的 goroutine 如果不知道「可以走了」，就会继续占着连接、占着内存，直到它们自己结束——或者永远不结束。
+`context.Context` 现在几乎出现在每一条 Go 调用链的第一个参数上。它看起来像语言的一部分，其实是后来才长进去的：2014 年先以独立包出现，2016 年才进标准库。要读懂它，得先问它是在什么规模、什么失败经验里被逼出来的，再看它到底包了哪几类问题，最后才落到 `context.go` 里那几种很小的结构体。
 
-`context.Context` 就是 Go 给这件事准备的标准答案：把**取消、超时、请求范围内的少量数据**放进一个值，顺着调用链往下传。本文从「没有它会怎样」开始，先把用法写对，再打开 `context` 包看取消树和四种实现。
+本文按这个顺序写：创作背景、解决的问题、源码。
 
-## 先看一个会漏的 goroutine
+## 一、创作背景
 
-假设处理一次请求要查库，你随手起一个 goroutine：
+### 调用树比 goroutine 更难停
+
+Go 1.0 把「起一个并发单元」变成了一行 `go f()`。起很容易，停却没有对等的原语。操作系统里可以杀线程、杀进程；Go 里没有 `KillG`。设计意图很明确：一个 goroutine 不该被另一个 goroutine 从外面粗暴掐掉，否则锁、buffer、连接都会停在半中间。停，必须是合作的——被停的那一方自己看见信号、自己收尾。
+
+早期代码因此长出各式各样的退出通道：
+
+```go
+func worker(quit <-chan struct{}, jobs <-chan Job) {
+    for {
+        select {
+        case <-quit:
+            return
+        case job := <-jobs:
+            do(job)
+        }
+    }
+}
+```
+
+一层调用还好办。Google 内部那种请求模型不是一层：入口一个 RPC，后面扇出到鉴权、存储、广告、再扇出到更下游。客户端断开或超时的时候，要停的不是一个 `worker`，而是整棵调用树。每一层自己发明一个 `quit`、`done`、`timeout`，签名迅速膨胀，漏传一层，那一层就永远收不到停。
+
+Sameer Ajmani 在 2014 年的文章 *Go Concurrency Patterns: Context* 里把这件事说死了：需要一个**可派生、可沿调用链传递**的值，把取消、截止时间和这次请求特有的少量数据绑在一起。它先作为 `golang.org/x/net/context` 放出，给 `net/http`、gRPC 这类库试用。Go 1.7（2016）把它搬进标准库 `context`，`net/http` 同时有了 `Request.Context()` / `WithContext`。从此「函数第一个参数叫 `ctx`」变成了社区约定，不是某个框架的私货。
+
+后面几年是修补，不是改方向：
+
+| 版本 | 补上的缺口 |
+| --- | --- |
+| Go 1.7 | 进标准库；HTTP 请求带上 context |
+| Go 1.8+ | `database/sql` 等补 `QueryContext` 一类 API |
+| Go 1.20 | `WithCancelCause` / `Cause`，取消可以带具体原因 |
+| Go 1.21 | `WithoutCancel`、`AfterFunc`，以及带 cause 的超时 |
+
+背景可以收成一句：**goroutine 解决了「怎么开始」，context 解决了「整棵调用树怎么一起结束」。**
+
+### 它有意做成接口，而不是全局开关
+
+另一种做法是进程级的 `shutdown` 通道。那解决不了「这一次请求取消了，另一次还在跑」。Google 的负载特征是海量**短命、彼此独立**的请求，每棵树自己的生命周期，树和树之间不能互相误伤。所以 context 从一开始就是**按调用派生出来的树**，不是单例。
+
+接口做得很小，四种能力分开，好让 `net/http`、数据库驱动、自写的 `select` 用同一套信号，而不去依赖某一个具体结构体。
+
+## 二、它解决的问题
+
+三件事，对应接口上四个方法（取消占了 `Done` 和 `Err` 两个）。
+
+### 1. 取消：调用方有权说停，且能传到每一层
+
+没有 context 时，超时只打断当前函数，派生出去的工作不知道：
 
 ```go
 func handle(w http.ResponseWriter, r *http.Request) {
     result := make(chan string, 1)
     go func() {
-        result <- queryDB(r.URL.Query().Get("id")) // 可能很慢
+        result <- queryDB(r.URL.Query().Get("id"))
     }()
 
     select {
@@ -32,50 +79,9 @@ func handle(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
-客户端已经收到 504 了，`queryDB` 还在跑。连接池里的连接、数据库会话、后面如果再调 RPC，全都不知道这次请求已经没人要了。超时只打断了 `handle`，没有打断它派生出去的工作。
+客户端已经拿到 504，`queryDB` 还占着连接。问题不是「少写了一个 sleep」，是**没有一条从入口通向叶子的停工线**。
 
-问题可以概括成三句：
-
-- **谁有权说停？** 调用方，不是被调用方
-- **停的消息怎么传到每一层？** 不能给每个函数都加一个 `quit chan`
-- **停之外还要带点什么？** 截止时间、请求 ID，而且只在这一次请求里有效
-
-`context` 把这三件事收成一个参数。约定是：它几乎总是函数的**第一个**参数，名字就叫 `ctx`。
-
-## Context 是一个很小的接口
-
-```go
-type Context interface {
-    Deadline() (deadline time.Time, ok bool)
-    Done() <-chan struct{}
-    Err() error
-    Value(key any) any
-}
-```
-
-四个方法各管一件事：
-
-| 方法 | 作用 |
-| --- | --- |
-| `Done()` | 返回一个 channel，被取消或到期时关闭。在 `select` 里听它 |
-| `Err()` | `Done` 关闭之后告诉你原因：`Canceled` 或 `DeadlineExceeded` |
-| `Deadline()` | 截止时间，还没设则 `ok == false` |
-| `Value(key)` | 取请求范围内挂上的值，没有则 `nil` |
-
-它**不是**容器，也不是锁。你不会在里面塞业务对象；你也不会用它替代函数参数。它是一条从入口通往叶子的控制线。
-
-标准库里所有派生都从两个根开始：
-
-```go
-ctx := context.Background() // 真正的根，永不取消
-ctx := context.TODO()       // 暂时不知道该传什么时的占位
-```
-
-两者行为一样，语义不同：`Background` 是「这里就是起点」，`TODO` 是「我还没想好，别学我这样写」。新代码能确定入口的话，用 `Background`。
-
-## 第一步：取消
-
-最基本的派生是 `WithCancel`。它返回一个子 context 和一个 `cancel` 函数。调用 `cancel()`，这个子 context 以及它下面再派生的全部子孙，`Done` 都会被关上。
+context 的约定是：谁发起这次工作，谁拿着 `cancel`；谁阻塞，谁听 `Done`。
 
 ```go
 func queryDB(ctx context.Context, id string) (string, error) {
@@ -84,21 +90,12 @@ func queryDB(ctx context.Context, id string) (string, error) {
         return "", err
     }
     defer rows.Close()
-    // ...
-    return name, nil
+    return scanName(rows)
 }
 
 func handle(w http.ResponseWriter, r *http.Request) {
     ctx, cancel := context.WithCancel(r.Context())
-    defer cancel() // 函数返回时一定释放；重复调用是安全的
-
-    go func() {
-        select {
-        case <-r.Context().Done():
-            cancel() // 客户端断开，主动停下游
-        case <-ctx.Done():
-        }
-    }()
+    defer cancel()
 
     name, err := queryDB(ctx, r.URL.Query().Get("id"))
     if err != nil {
@@ -109,11 +106,9 @@ func handle(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
-`database/sql` 的 `QueryContext` 会监听 `ctx.Done()`。客户端断开或你自己 `cancel()`，驱动会尽量把查询停掉。
+`r.Context()` 在客户端断开时会被服务器取消。`QueryContext` 听同一个 `Done`。入口取消，叶子上的驱动也会尽量停掉查询。
 
-`defer cancel()` 不是可选项。`WithCancel` 会向父节点登记自己；不 cancel，这个节点会一直挂在父的孩子表里，父一直活着时就是泄漏。及时 cancel 等于从树上摘掉自己。
-
-工作 goroutine 怎么停？标准写法是 `select`：
+工作循环的标准形状是 `select`：
 
 ```go
 func worker(ctx context.Context, jobs <-chan Job) error {
@@ -133,22 +128,17 @@ func worker(ctx context.Context, jobs <-chan Job) error {
 }
 ```
 
-`Done()` 在未取消时是一个一直阻塞的 channel；取消后变成已关闭的 channel。`select` 到关闭的 channel 会立刻成功。`Err()` 在关闭前返回 `nil`，关闭后返回原因。
+取消语义有三条，漏一条就会在规模上去之后爆：
 
-## 第二步：超时和截止时间
+- **父取消，子全部取消。** 整棵树一起倒。
+- **子取消，父不受影响。** 下游失败不该误杀兄弟分支。
+- **已经取消的父上再派生，孩子立刻是取消状态。** 不能出现「父死了，子还活着」的窗口。
 
-取消要人去按。超时是闹钟替你按。
+这就是「树」，不是「广播变量」。
 
-```go
-ctx, cancel := context.WithTimeout(parent, 200*time.Millisecond)
-defer cancel()
-```
+### 2. 截止时间：停也可以由闹钟来按
 
-`WithTimeout` 是 `WithDeadline(parent, time.Now().Add(d))` 的语法糖。到期后 context 自行取消，`Err()` 是 `context.DeadlineExceeded`。
-
-仍然要 `defer cancel()`：请求提前结束时，把还没响的定时器拆掉，避免无意义的唤醒。
-
-一个更完整的请求处理：
+人手 `cancel()` 适合「客户端走了」。SLA 是另一件事：这次搜索最多 300ms，到期必须回。
 
 ```go
 func handleSearch(w http.ResponseWriter, r *http.Request) {
@@ -156,14 +146,14 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
     defer cancel()
 
     result, err := search(ctx, r.URL.Query().Get("q"))
+    if errors.Is(err, context.DeadlineExceeded) {
+        http.Error(w, "timeout", http.StatusGatewayTimeout)
+        return
+    }
+    if errors.Is(err, context.Canceled) {
+        return
+    }
     if err != nil {
-        if errors.Is(err, context.DeadlineExceeded) {
-            http.Error(w, "timeout", http.StatusGatewayTimeout)
-            return
-        }
-        if errors.Is(err, context.Canceled) {
-            return // 客户端走了，不必再写响应
-        }
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return
     }
@@ -175,7 +165,7 @@ func search(ctx context.Context, q string) (*Result, error) {
     if err != nil {
         return nil, err
     }
-    remote, err := searchRemote(ctx, q) // HTTP client 把 ctx 传到 RoundTrip
+    remote, err := searchRemote(ctx, q)
     if err != nil {
         return nil, err
     }
@@ -183,28 +173,20 @@ func search(ctx context.Context, q string) (*Result, error) {
 }
 ```
 
-`searchLocal` 和 `searchRemote` 不用各自设超时。截止时间在入口设一次，整条链路上的 `http.NewRequestWithContext`、`QueryContext`、自己的 `select` 都会看见同一个 deadline。某层再套一个更短的 `WithTimeout`，只收紧自己这一段，不会把父的截止时间改松。
+超时只在入口设一次。`searchLocal`、`searchRemote`、`http.NewRequestWithContext` 看见的是同一条 deadline。某层再套一个更短的 `WithTimeout`，只能**收紧**自己这一段，不能把父的截止时间改松——更早的那个一定会先响。
 
-`Deadline()` 给还需要自己排期的代码用：
+`Deadline()` 留给还要自己排期的代码：还剩 20ms 就别再发一个已知要 50ms 的下游。
 
-```go
-deadline, ok := ctx.Deadline()
-if ok {
-    // 给下游留 20ms 收尾
-    if time.Until(deadline) < 20*time.Millisecond {
-        return context.DeadlineExceeded
-    }
-}
-```
+`WithTimeout` 是 `WithDeadline(parent, time.Now().Add(d))` 的语法糖。到期后 `Err()` 是 `DeadlineExceeded`，和人手取消的 `Canceled` 分开，调用方可以回不同的 HTTP 状态码。
 
-## 第三步：请求范围内的值
+### 3. 请求范围内的值：不污染每一个函数签名
 
-`WithValue` 在链上挂一对 key/value，不改变取消和超时：
+一次请求里，日志和 tracing 几乎每一层都要用请求 ID，但不该把 `reqID string` 加进几十个函数签名。`WithValue` 把这类**与这次请求同生共死、又不是业务入参**的数据挂在链上。
 
 ```go
-type ctxKey string
+type ctxKey struct{}
 
-const requestIDKey ctxKey = "requestID"
+var requestIDKey = ctxKey{}
 
 func withRequestID(ctx context.Context, id string) context.Context {
     return context.WithValue(ctx, requestIDKey, id)
@@ -216,107 +198,189 @@ func requestIDFrom(ctx context.Context) string {
 }
 ```
 
-key 必须是可比较的。用自定义的未导出类型，避免和别人的 `"requestID"` 字符串撞车。取值时做一次类型断言。
+key 用未导出类型，避免和别的包的 `"requestID"` 字符串撞车。
 
-适合放进去的，是这次请求里**每一层都可能用到、又不想污染所有函数签名**的东西：请求 ID、trace span、登录用户的只读身份。不适合放可选业务参数——那会让函数签名撒谎，编译器帮不上忙，拼写错误要到运行时才爆。
+这里有一条硬边界，是 context 被误用最多的地方：
 
 ```go
-// 不要这样
+// 不要：用 Value 传业务参数
 ctx = context.WithValue(ctx, "page", 2)
-ctx = context.WithValue(ctx, "filter", "active")
 users := ListUsers(ctx)
 
-// 这样
-users := ListUsers(ctx, ListUsersQuery{Page: 2, Filter: "active"})
+// 要：签名里看得见
+users := ListUsers(ctx, ListUsersQuery{Page: 2})
 ```
 
-`Value` 的查找是沿父链往上走，找到第一个匹配的 key。后面会看到，这就是一个链表，不是 map。
+适合放的：请求 ID、trace span、已鉴权用户的只读身份。不适合放的：分页、过滤器、可选配置——那些该出现在参数列表里，让编译器和测试抓住。
 
-## 取消是一棵树
-
-每次 `WithCancel` / `WithTimeout` / `WithDeadline` 都会挂到父节点下面。父一取消，子全部取消。子取消，父不受影响。
+### 一张图串起来
 
 ```text
-r.Context()                    客户端断开，整棵树倒
- └─ WithTimeout(300ms)         到期，只倒这一枝
-     ├─ searchLocal(ctx)
-     └─ WithTimeout(100ms)     更短的下游超时
-         └─ searchRemote(ctx)
+r.Context()                      客户端断开，整棵树倒
+ └─ WithValue(requestID)         不产生新的取消点，信号穿过它
+     └─ WithTimeout(300ms)       到期，这一枝自己倒
+         ├─ searchLocal(ctx)
+         └─ WithTimeout(100ms)   只能更短，不能更长
+             └─ searchRemote(ctx)
 ```
 
-这就是 context 能「循调用链传播」的原因：它不是全局开关，是一棵按请求长出来的树。一个请求一棵树，两棵树互不打扰。
+一个请求一棵树。两棵树互不打扰。`WithValue` 也是子节点，但不登记到父的「孩子表」里，因为它不引入新的取消点。
 
-`WithValue` 也产生子节点，但这个节点**不会**登记到父的孩子表里，因为它不引入新的取消点。取消信号穿过它，继续往下传——`valueCtx` 自己的 `Done` 直接调用内嵌的父 `Done`。
+Go 1.21 的 `WithoutCancel(parent)` 故意切断这条线：请求已经结束，审计日志还要写完。切断取消，保留 deadline 和 value。用之前要想清楚，你是在做收尾，还是在掩盖一次忘记 `cancel`。
 
-Go 1.21 起还有 `WithoutCancel(parent)`：派生一个**听不见父取消**的 context，用于「请求已经结束，但审计日志还要写完」这种收尾。它切断取消，保留 deadline 和 value。要用的时候先想清楚：你是在故意让工作活过请求，还是在掩盖一次忘记 cancel。
+### 它刻意不解决的
 
-## 打开源码：四种实现
+- **强制杀死 goroutine。** 听不到 `Done` 的循环，cancel 了也还在跑。
+- **替代函数参数。** 见上面的 Value。
+- **对象的一生。** context 描述一次调用，不该塞进结构体字段当成员变量。
+- **库内部写死超时。** 超时策略属于调用方。库应尊重传入的 ctx。
 
-`context` 包对外只暴露接口，对内是几种很小的结构体。读它们比读文档更能记住行为。
+## 三、源码
 
-### emptyCtx：永不取消的根
+`src/context/context.go` 对外只暴露接口和一组 `With*` 工厂。对内是几种很小的结构体，叠成一棵树。读它们比读文档更能记住行为。下面按 Go 1.22 附近的结构说，字段名后续小版本可能微调，算法没有变。
 
-`background` 和 `todo` 是两个 `emptyCtx` 单例。四个方法都是空操作：`Done` 返回 `nil` channel（`select` 到 `nil` channel 永远不会命中），`Err` 返回 `nil`，`Value` 返回 `nil`，没有 deadline。
+### 接口：四个方法，没有第五个
 
-根不会被取消，所以树上的泄漏最终会停在这里：你忘了 cancel 的节点，会一直挂在某个长期活着的 parent 上。HTTP 服务器里 parent 往往是这次请求的 `r.Context()`，请求结束后它会被取消，忘 cancel 的子节点通常也会被带走。进程级的 `Background()` 上挂东西，忘 cancel 就是真泄漏。
+```go
+type Context interface {
+    Deadline() (deadline time.Time, ok bool)
+    Done() <-chan struct{}
+    Err() error
+    Value(key any) any
+}
+```
 
-### cancelCtx：真正干活的节点
+| 方法 | 实现上真正做的事 |
+| --- | --- |
+| `Done()` | 返回一个在取消时**关闭**的 channel。关闭是 Go 里唯一内建的广播：所有 `select` 同时被唤醒 |
+| `Err()` | channel 关掉之后才能读到原因；关掉前返回 `nil` |
+| `Deadline()` | 没有闹钟的节点直接问父；`ok == false` 表示这条链上从未设过截止时间 |
+| `Value(key)` | 本节点没有就问父，一直问到根 |
 
-简化后的结构大致是：
+没有 `Cancel()` 方法。取消权在工厂返回的那个函数上，不在接口上。这样任意拿到 `Context` 的下游都不能取消祖先，只能听。
+
+两个根：
+
+```go
+var (
+    background = new(emptyCtx)
+    todo       = new(emptyCtx)
+)
+
+func Background() Context { return background }
+func TODO() Context       { return todo }
+```
+
+行为完全一样：永不取消。语义不同——`Background` 是「这里就是起点」，`TODO` 是「我还没想好」。HTTP 服务器的入口用的是请求级 context，不是这两个。
+
+### emptyCtx：四个空操作
+
+```go
+type emptyCtx struct{}
+
+func (emptyCtx) Deadline() (deadline time.Time, ok bool) { return }
+func (emptyCtx) Done() <-chan struct{}                   { return nil }
+func (emptyCtx) Err() error                              { return nil }
+func (emptyCtx) Value(key any) any                       { return nil }
+```
+
+`Done` 返回 `nil` channel。`select` 里对 `nil` channel 的 case 永远不会命中，等价于「这条退出路径不存在」。
+
+根不会被取消，忘了 `cancel` 的节点如果挂在 `Background()` 上，就是真泄漏。挂在 `r.Context()` 上时，请求结束服务器会取消父节点，孩子通常会被带走——但那是运气，不是借口。`defer cancel()` 仍然是从父的孩子表里摘掉自己。
+
+### canceler：孩子不必是同一种结构体
+
+```go
+type canceler interface {
+    cancel(removeFromParent bool, err, cause error)
+    Done() <-chan struct{}
+}
+```
+
+`cancelCtx` 和 `timerCtx` 都实现它。父的孩子表用接口存，超时节点和普通取消节点可以挂在同一棵树上。`valueCtx` **不**实现这个接口，所以不进孩子表。
+
+### cancelCtx：广播和级联都在这里
+
+简化后：
 
 ```go
 type cancelCtx struct {
-    Context                     // 父
+    Context // 父
 
     mu       sync.Mutex
-    done     atomic.Value       // chan struct{}，懒创建
+    done     atomic.Value // 懒创建的 chan struct{}
     children map[canceler]struct{}
     err      error
-    cause    error              // Go 1.20+ WithCancelCause
+    cause    error
 }
 ```
 
-`Done()` 第一次调用时才 `make(chan struct{})`，放进 `atomic.Value`。取消时关掉这个 channel。所有在 `select` 里等着的 goroutine 被同时唤醒——关闭 channel 是 Go 里唯一内建的「广播」。
+`WithCancel` 干两件事：new 一个 `cancelCtx`，再 `propagateCancel` 把它挂到父上。
 
-`cancel` 的流程可以记成四步：
+`Done()` 第一次被调用才 `make(chan struct{})`，放进 `atomic.Value`。取消之前没有人听，就不分配 channel。
+
+取消函数可以重入、可以并发。核心在 `cancel`：
 
 ```text
-1. 已经取消过就返回（cancel 可重入、可并发）
-2. 记下 err / cause，关闭 done
-3. 遍历 children，对每个孩子再调 cancel
-4. 把 children 置 nil；若需要，从父的孩子表里删掉自己
+1. 已经有 err 了就返回（第二次 cancel 是空操作）
+2. 记下 err、cause
+3. 关闭 done channel  —— 所有阻塞在 Done 上的 goroutine 被唤醒
+4. 遍历 children，对每个孩子 cancel(false, err, cause)
+5. children = nil
+6. 若 removeFromParent，从父的孩子表里删掉自己
 ```
 
-父在创建子的时候，如果自己还没取消，就把子放进 `children`；如果自己**已经**取消，则立刻取消这个新子，不再入表。这保证了「先 cancel 父、再 WithCancel」也不会漏。
+第 4 步的 `removeFromParent=false`：整棵子树正在被拆，不必每个孙子再回头改祖父的 map，祖父马上就会把自己的表丢掉。
 
-孩子通过 `canceler` 接口挂上来，不直接依赖 `*cancelCtx`。`timerCtx` 同样实现这个接口，所以超时节点也能当别人的孩子。
+`propagateCancel` 处理挂到父上的两种时序：
 
-`WithCancelCause` 让你可以带一个更具体的错误：
+- 父**还没**取消：加锁，放进 `parent.children`
+- 父**已经**取消：立刻 `child.cancel(...)`，不入表
 
-```go
-ctx, cancel := context.WithCancelCause(parent)
-cancel(fmt.Errorf("client gone"))
-fmt.Println(context.Cause(ctx)) // client gone
-fmt.Println(ctx.Err())          // context canceled
-```
+所以「先 cancel 父，再 WithCancel」不会漏：孩子一出生就是取消状态。
 
-`Err()` 对取消仍然是 `Canceled`，方便 `errors.Is`。真正原因走 `Cause`。下游库多半只认 `Err()`，自己的代码可以多看一眼 `Cause`。
+闭包返回给调用方的那个 `cancel`，内部就是 `c.cancel(true, Canceled, cause)`。`true` 表示从父表摘掉自己——这就是 `defer cancel()` 必须存在的原因：请求正常结束时，父可能还活着（例如 `Background`），不摘就是泄漏。
 
-### timerCtx：在 cancelCtx 上加一只闹钟
+`WithCancelCause` 只是让第 2 步的 `cause` 变成你传入的 error。`Err()` 对人为取消仍然返回 `Canceled`，方便 `errors.Is`；具体原因走 `context.Cause(ctx)`。
+
+### timerCtx：cancelCtx 加一只闹钟
 
 ```go
 type timerCtx struct {
-    *cancelCtx
-    timer *time.Timer
+    cancelCtx
+    timer    *time.Timer
     deadline time.Time
+}
+
+func WithDeadline(parent Context, d time.Time) (Context, CancelFunc) {
+    if cur, ok := parent.Deadline(); ok && cur.Before(d) {
+        // 父更早到期，自己不必再设 timer
+        return WithCancel(parent)
+    }
+    c := &timerCtx{deadline: d}
+    c.Context = parent
+    propagateCancel(parent, c)
+    dur := time.Until(d)
+    if dur <= 0 {
+        c.cancel(true, DeadlineExceeded, nil)
+        return c, func() { c.cancel(false, Canceled, nil) }
+    }
+    c.timer = time.AfterFunc(dur, func() {
+        c.cancel(true, DeadlineExceeded, nil)
+    })
+    return c, func() { c.cancel(true, Canceled, nil) }
 }
 ```
 
-创建时若父的 deadline 比自己更早，就不必再设定时器，直接用父的即可——更早的那个一定会先响。否则 `time.AfterFunc` 在截止点调 `cancel`，`err` 设为 `DeadlineExceeded`。
+三处值得对着看：
 
-手动 `cancel()` 会先 `timer.Stop()`，再走普通取消。这就是为什么超时后也要 `defer cancel()`：请求提前结束时把 timer 从运行时堆上摘掉。
+1. **父的 deadline 更早，就退化成 `WithCancel`。** 闹钟只需要一只，挂在真正最早的那层。
+2. **已经过期，创建当下就 cancel。** 不会出现「WithTimeout(0) 还跑一会儿」。
+3. **人手 cancel 时先 `timer.Stop()`。** 请求提前结束，要把还没响的 timer 从运行时堆上摘掉。这是超时也要 `defer cancel()` 的第二个原因：第一个是从父表摘节点，第二个是拆闹钟。
 
-### valueCtx：一条向上的链表
+`Deadline()` 返回自己存的时间。`Err()` 到期时是 `DeadlineExceeded`，人手 cancel 时是 `Canceled`，和接口文档一致。
+
+### valueCtx：向上的链表，不是 map
 
 ```go
 type valueCtx struct {
@@ -328,77 +392,58 @@ func (c *valueCtx) Value(key any) any {
     if c.key == key {
         return c.val
     }
-    return c.Context.Value(key)
+    return value(c.Context, key)
 }
 ```
 
-没有 map，没有哈希。每次 `WithValue` 包一层，查找是 O(深度)。这就是「只放极少几个值」的实现理由：深度通常是个位数，线性扫描比维护一张同步 map 更便宜，也更简单。
+每次 `WithValue` 包一层。查找沿父链走，O(深度)。深度通常是个位数，线性扫描比给每个节点维护一张同步 map 更便宜，也没有额外的锁。这就是文档强调「只放极少几个值」的实现理由。
 
-key 用指针比较（对反射类型）或值比较。两个不同包里的 `type key struct{}` 零值不相等，这是推荐未导出类型作 key 的原因。
+`Done` / `Err` / `Deadline` 全部委托给内嵌的父。取消信号穿过这一层，就像它不存在。
 
-`valueCtx` 不实现 `canceler`，不进父的 `children`。它只是一层透明包装。
+key 的相等用 Go 的 `==`。两个包各自 `type key struct{}` 的零值不相等，这是推荐未导出类型的原因。字符串 `"requestID"` 会撞。
 
-## 串起来的一次调用
-
-一次带超时和请求 ID 的下游 HTTP 调用，内部实际长这样：
+### 一次真实调用在内存里长什么样
 
 ```go
-ctx := r.Context()                                // 服务器给的 cancelCtx
-ctx = context.WithValue(ctx, requestIDKey, id)    // valueCtx
+ctx := r.Context()                             // 服务器的 cancelCtx
+ctx = context.WithValue(ctx, requestIDKey, id) // valueCtx
 ctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
-defer cancel()                                    // timerCtx -> cancelCtx -> valueCtx -> ...
+defer cancel()
 req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 resp, err := http.DefaultClient.Do(req)
 ```
 
 ```text
-timerCtx (300ms)
+timerCtx  deadline=now+300ms  timer=AfterFunc
   └─ cancelCtx
-       └─ valueCtx {requestID: "abc"}
-            └─ 请求级 cancelCtx   ← 客户端断开从这里灌进来
+       children: 可能还有别的下游
+       done: chan struct{}
+       Context ──▶ valueCtx {key: requestIDKey, val: "abc"}
+                      Context ──▶ 请求级 cancelCtx
+                                     ↑ 客户端断开从这里灌进来
 ```
 
-`http.Client` 在 RoundTrip 里 `select` 这个 `Done`。到期、客户端断开、你手动 cancel，都会让 `Do` 返回。`Value` 沿链表能取到 `abc`，日志和 tracing 不用改 `Do` 的签名。
+`http.Client` 的 RoundTrip 在 `select` 里听最外层 `Done`。三件事任意一件都会让 `Do` 返回：定时器响、人手 `cancel`、客户端断开沿树向下灌。`Value(requestIDKey)` 从 timer 走到 value 那一层就返回 `"abc"`，不用改 `Do` 的签名。
 
-## 几个会写错的地方
+### 实现加在用法上的几条约束
 
-**把 nil 当 context 传。** 标准库很多函数对 nil 会 panic。没有就 `context.Background()`，不要图省事。
+这些不是风格问题，是结构体自己长出来的：
 
-**存在结构体里当「对象的一生」。** context 描述的是一次调用的生命周期，不是对象的生命周期。字段里存一个 ctx，过一段时间它取消了，对象还活着，后面的方法会莫名其妙失败。每次方法调用把 ctx 当参数传进去。
-
-**在库函数里无条件 WithTimeout。** 超时策略属于调用方。库如果写死 3 秒，调用方那个 200ms 的 deadline 就被你盖掉了——更准确说，你无法放宽父的 deadline，但你会让「库内部又套一层」变得难以理解。库应该尊重传入的 ctx，把超时留给应用。
-
-**忘记在循环里听 Done。** CPU 密集或大循环如果不定期看 `ctx.Err()`，取消信号要等到循环自己结束才有用。
-
-```go
-for i := range items {
-    if err := ctx.Err(); err != nil {
-        return err
-    }
-    process(items[i])
-}
-```
-
-**用 Value 传必选参数。** 前面说过。签名里看得见的参数，才能被编译器和测试抓住。
-
-**在 cancel 之后还用 ctx 启动新工作，却指望它继续跑。** 已经取消的 ctx，再 `WithCancel` 得到的孩子会立刻被取消。需要活过这次请求，用 `WithoutCancel` 或从 `Background` 重新开一枝，并且想清楚谁来收尾。
+| 用法 | 对应的实现原因 |
+| --- | --- |
+| 不要传 `nil` Context | 工厂和标准库大量解引用，没有空值检查 |
+| `defer cancel()` | 从父的 `children` 摘自己；有 timer 还要 `Stop` |
+| Value 只放很少的数据 | 链表查找，不是哈希表 |
+| 已取消的 ctx 上再 `WithCancel`，孩子立刻死 | `propagateCancel` 发现父已有 `err` 就当场 cancel |
+| 库不要写死 `WithTimeout(3s)` | 无法放宽父的 deadline，只会让调用方的 SLA 更难理解 |
+| 循环里偶而看一眼 `ctx.Err()` | 没有抢占式取消，CPU 密集路径必须自己合作 |
 
 ## 收住
 
-`context` 的作用可以缩成一张表：
+context 不是语法糖，是对一种失败经验的标准化。
 
-| 你想做的事 | 用什么 |
-| --- | --- |
-| 给调用链一个起点 | `Background` |
-| 让下游停下来 | `WithCancel`，听 `Done` |
-| 到期自动停 | `WithTimeout` / `WithDeadline` |
-| 带请求 ID / trace | `WithValue`，key 用未导出类型 |
-| 收尾工作不受请求取消影响 | `WithoutCancel`（想清楚再用不迟） |
+- **背景：** goroutine 让「开始」变便宜之后，扇出型 RPC 需要一种合作式的、按请求隔离的「结束」。2014 年以独立包出现，1.7 进标准库，变成调用约定。
+- **问题：** 取消要沿树向下传、截止时间只能收紧不能放宽、请求级的少量数据不要污染签名。三件事一个接口。
+- **源码：** `emptyCtx` 是永不取消的根；`cancelCtx` 用关 channel 做广播、用 `children` 做级联；`timerCtx` 在这之上加一只闹钟；`valueCtx` 是向上查找的链表。树的边就是一次 `With*`。
 
-实现上它是一棵树：`cancelCtx` 负责广播和级联，`timerCtx` 多一只闹钟，`valueCtx` 是向上查找的链表，`emptyCtx` 是永不取消的根。对你写业务代码而言，记住三件事就够往下传了：
-
-1. ctx 放第一个参数，一直传到会阻塞的那一层
-2. `WithCancel` / `WithTimeout` 的 `cancel` 用 `defer` 调掉
-3. 阻塞处用 `select` 听 `ctx.Done()`，或调用同样听它的标准库 API
-
-取消信号一旦成为调用约定，超时和泄漏就从「每个函数自己发明一个 quit channel」变成了语言里的一件小事。
+写业务时落到三行习惯就够：ctx 放第一个参数传到会阻塞的那一层；`WithCancel` / `WithTimeout` 的 `cancel` 用 `defer` 调掉；阻塞处听 `ctx.Done()`，或者调用同样听它的标准库 API。

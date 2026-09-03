@@ -1,5 +1,5 @@
 ---
-title: Go context：创作背景、要解决的问题和源码
+title: 杀不掉的 goroutine：Go context 的由来、边界与源码
 date: 2026-09-02 14:50:00
 categories: Golang
 tags:

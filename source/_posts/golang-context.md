@@ -1,5 +1,5 @@
 ---
-title: 杀不掉的 goroutine：Go context 的设计、源码与代价
+title: Go context：设计、源码与代价
 date: 2026-09-02 14:50:00
 categories: Golang
 tags:

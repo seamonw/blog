@@ -1,5 +1,5 @@
 ---
-title: goroutine 很轻，所以你更需要任务池
+title: Go 任务池：并发限制、排队与退出
 date: 2026-09-14 20:12:00
 categories: Golang
 tags:
@@ -11,7 +11,7 @@ tags:
 
 「goroutine 很轻，所以不需要线程池」和「所以可以随便 `go`」是两句经常连在一起说的话。前半句对：Go 没有 OS 线程池那种「创建太贵必须复用」的压力。后半句是错的。任务池在 Go 里要管的不是创建开销，是**同时在飞的工作有多少、多出来的去排队还是被丢掉、失败了怎么停**。
 
-调度器怎么把 G 轮转到 P 上，已经写过一篇：[Go 调度器：G、M、P](/blog/2026/09/02/golang-gmp/)。那篇回答的是运行时怎么跑；本文回答的是业务侧什么时候不该再 `go f()`。取消怎么往下传，见 [context](/blog/2026/09/02/golang-context/)。
+调度器怎么把 G 轮转到 P 上，已经写过一篇：[Go 调度器：G、M、P 与 goroutine 调度](/blog/2026/09/02/golang-gmp/)。那篇回答的是运行时怎么跑；本文回答的是业务侧什么时候不该再 `go f()`。取消怎么往下传，见 [Go context：设计、源码与代价](/blog/2026/09/02/golang-context/)。
 
 按四条线走：
 
@@ -251,7 +251,7 @@ func SubmitErr(p *Pool, ctx context.Context, fn func() error) <-chan error {
 }
 ```
 
-真正要取消**正在跑**的任务，只能靠任务自己听 `ctx`。池能取消的是「还没进 worker 的排队」：`Submit` 在 `ctx.Done()` 时放弃入队。已经在跑的 `fn`，框架插不进去——这和「不能从外面 Kill goroutine」是同一条约束，[context 那篇](/blog/2026/09/02/golang-context/)写过原因。所以 `fn` 的签名更好是 `func(ctx context.Context)`，创建池的人把请求级 ctx 传进去，任务在 I/O 点检查。
+真正要取消**正在跑**的任务，只能靠任务自己听 `ctx`。池能取消的是「还没进 worker 的排队」：`Submit` 在 `ctx.Done()` 时放弃入队。已经在跑的 `fn`，框架插不进去——这和「不能从外面 Kill goroutine」是同一条约束，[Go context：设计、源码与代价](/blog/2026/09/02/golang-context/)写过原因。所以 `fn` 的签名更好是 `func(ctx context.Context)`，创建池的人把请求级 ctx 传进去，任务在 I/O 点检查。
 
 ```go
 func (p *Pool) SubmitCtx(ctx context.Context, fn func(context.Context)) error {

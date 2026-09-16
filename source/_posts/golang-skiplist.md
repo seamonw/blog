@@ -1,5 +1,5 @@
 ---
-title: 跳表赢的不是好写：用 Go 实现 skiplist
+title: Go 跳表的原理与实现
 date: 2026-09-15 20:10:00
 categories: Golang
 tags:
@@ -281,7 +281,7 @@ func (l *List[K, V]) LevelHist() []int {
 
 上面那份实现是**非并发安全**的，多 goroutine 同时 `Set` 会写坏指针。补救路径有三档，成本差一个量级。
 
-**第一档：一把 `sync.RWMutex`。** `Get`/`Range` 拿读锁，`Set`/`Delete` 拿写锁。绝大多数进程内场景到这里就够了。注意 `Range` 持锁的时间等于回调的执行时间，`f` 里做 I/O 就等于把写者锁死几十毫秒 —— 这和把慢任务塞进任务池堵住 worker 是同一类错误，见 [goroutine 很轻，所以你更需要任务池](/blog/2026/09/14/golang-worker-pool/)。要长时间扫描就先把 key 收集出来再放锁。
+**第一档：一把 `sync.RWMutex`。** `Get`/`Range` 拿读锁，`Set`/`Delete` 拿写锁。绝大多数进程内场景到这里就够了。注意 `Range` 持锁的时间等于回调的执行时间，`f` 里做 I/O 就等于把写者锁死几十毫秒 —— 这和把慢任务塞进任务池堵住 worker 是同一类错误，见 [Go 任务池：并发限制、排队与退出](/blog/2026/09/14/golang-worker-pool/)。要长时间扫描就先把 key 收集出来再放锁。
 
 **第二档：单写多读，无锁。** RocksDB 的 `InlineSkipList`、LevelDB 的 memtable 走这条路，前提是**只插不删**（删除在 LSM 里是写一条 tombstone，也是插入）。少了删除，无锁就简单得多：
 

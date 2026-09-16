@@ -1,5 +1,5 @@
 ---
-title: KCP 不是「没有队头阻塞的 TCP」：读完 ikcp.c 再说快
+title: KCP 源码阅读：可靠 UDP 的 ARQ 与按序交付
 date: 2026-09-15 20:40:00
 categories: 网络
 tags:
@@ -405,7 +405,7 @@ for {
 - **`conv` 是客户端随机生成、服务端从首包学的。** `DialWithOptions` 里 `binary.Read(rand.Reader, binary.LittleEndian, &convid)`；服务端 `sess.go` 里按 `addr.String()` 在 map 里找会话，找不到就用包头前 4 字节的 `conv` 新建一个。**解复用的键是 remote addr，不是 `conv`**，`conv` 只用来检测「同一个地址换了会话」。这也解释了为什么 KCP 协议本身不需要握手。
 - **`UDPSession` 自带一把 `sync.Mutex`。** 所有进 `ikcpcb` 的调用都在锁内，因为 `ikcpcb` 本身完全没有同步。
 
-如果你在设计自己的封装层，会发现要补的东西和写一个 RPC 框架时要补的那堆基础设施高度重合——分帧、会话、超时语义，见 [HTTP 装不成 RPC：从协议拆解到手写一个 Go RPC](/blog/2026/09/04/rpc-from-scratch/)。取消和超时的传播则最好从一开始就交给 `context`，见 [杀不掉的 goroutine：Go context 的设计、源码与代价](/blog/2026/09/02/golang-context/)。
+如果你在设计自己的封装层，会发现要补的东西和写一个 RPC 框架时要补的那堆基础设施高度重合——分帧、会话、超时语义，见 [RPC 原理、Go net/rpc 与一份极简实现](/blog/2026/09/04/rpc-from-scratch/)。取消和超时的传播则最好从一开始就交给 `context`，见 [Go context：设计、源码与代价](/blog/2026/09/02/golang-context/)。
 
 ## 九、避坑
 

@@ -1,5 +1,5 @@
 ---
-title: Go 调度器：G、M、P 怎么把 goroutine 跑起来
+title: Go 调度器：G、M、P 与 goroutine 调度
 date: 2026-09-02 16:30:00
 categories: Golang
 tags:

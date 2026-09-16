@@ -1,5 +1,5 @@
 ---
-title: HTTP 装不成 RPC：从协议拆解到手写一个 Go RPC
+title: RPC 原理、Go net/rpc 与一份极简实现
 date: 2026-09-04 16:20:00
 categories: RPC
 tags:

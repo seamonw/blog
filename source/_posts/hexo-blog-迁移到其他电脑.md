@@ -1,5 +1,5 @@
 ---
-title: hexo blog 迁移到其他电脑
+title: 将 Hexo 博客迁移到另一台电脑
 date: 2023-05-06 11:03:21
 categories: Hexo
 tags:

@@ -9,334 +9,267 @@ tags:
 	- 并发
 ---
 
-「goroutine 很轻，所以可以万并发。」这句话被说过太多次，以至于很多人把它理解成：起一万个 goroutine 和起一万个函数调用差不多便宜，而且这一万个会同时往前跑。
+「goroutine 很轻，所以可以万并发。」创建便宜这半句是真的：Linux/amd64 上起始栈最小 2KB（`fixedStack`），`go f()` 不走一次 `clone`。「一万个同时往前跑」这半句是错的——同时执行 Go 代码的至多 `GOMAXPROCS` 个，其余在排队，或者在 channel、网络、系统调用上睡着。
 
-前半句对了一半。goroutine 的**创建**确实便宜：起始栈大约 2KB，远小于操作系统线程默认那几 MB；`go f()` 不走一次 `clone`。后半句是错的。真正同时在跑 Go 代码的，最多只有 `GOMAXPROCS` 个，默认等于逻辑 CPU 数。其余的要么在排队，要么在 channel / 网络 / 系统调用上睡着。睡着并不免费——`g` 结构体、栈、等待项都还在。
+调度器要回答的不是「怎么让一万个 goroutine 同时跑」，而是：**远多于 CPU 的 goroutine，怎么在少量线程上低开销地轮转，并且在其中一些被内核堵住时，不把 CPU 一起堵死。**
 
-调度器要回答的不是「怎么让一万个 goroutine 同时跑」，而是：**远多于 CPU 的 goroutine，怎么在少量线程上被公平、低开销地轮转，并且在阻塞时不把 CPU 也堵死。**
+本文的事实以 Go 1.27 的 `runtime/proc.go` 为准，涉及版本差异的地方会标出。
 
-本文从两种会失败的设计说起，再落到 G、M、P，队列和工作窃取，系统调用与抢占，最后是 netpoller。看完你会知道「很轻」轻在哪，账单又出在哪。
+## 「很轻」的账单
 
-## 「很轻」到底轻在哪
-
-对照一张表：
+轻在栈小、创建和切换不进内核；账单出在元数据、栈增长、占线程的阻塞和纯 CPU 工作上。
 
 | | OS 线程 | goroutine |
 | --- | --- | --- |
 | 创建 | `clone` / `CreateThread`，微秒级起 | `go f()`，一次内存分配量级 |
-| 栈 | 通常预留约 8MB 虚拟空间 | 起始约 2KB，按需倍增拷贝 |
-| 切换 | 进内核：保存寄存器、调度实体 | 用户态：保存少量寄存器，回到 `schedule` |
-| 同时执行 | 每个线程都是一个内核实体 | 同时执行 Go 代码的上限是 P 的数量 |
+| 栈 | 通常预留 8MB 虚拟空间 | 起始 2KB 起，按需倍增拷贝 |
+| 切换 | 进内核：保存寄存器、换调度实体 | 用户态：少量寄存器 + 回到 `schedule` |
+| 同时执行 | 每条线程都是一个内核实体 | 上限是 P 的数量 |
 
-轻的是：栈小、创建不进内核、切换不进内核。
+不轻的四笔：
 
-不轻的是另外几笔：
+- **`allgs` 只增不减。** 创建过的 `g` 对象不释放，只进自由列表复用。峰值百万再降下来，元数据还挂着。
+- **栈会涨，也会被丢。** 起始大小不是固定的 2KB：`startingStackSize` 每轮 GC 按近期平均栈大小上调。G 退出时若栈已不等于 `startingStackSize`，直接释放，下次重新分配。
+- **阻塞可能占着 M。** 网络走 netpoller 不占线程；一个卡住的文件 `Read`、一个慢 cgo 调用会把 M 钉死，P 被别人拿走，进程线程数上涨。
+- **真·CPU 工作不打折。** 一万个 G 各自算圆周率，仍然只有 `GOMAXPROCS` 个在跑，调度本身还要占周期。
 
-- **每个 goroutine 一份 `g`。** 一旦创建过，`allgs` 里的 `g` 对象本身不会被释放，只复用。起过百万再降下来，元数据还挂着。
-- **栈会涨。** 递归深、框架大，栈从 2KB 拷到 4KB、8KB……拷栈要扫指针。涨上去的栈，goroutine 退出后如果超过起始大小，会被丢掉，下次重新分配。
-- **阻塞如果占着 M。** 网络 I/O 走 netpoller，不占线程；一个卡住的文件 `Read`、一个慢 cgo，会把 M（OS 线程）钉死。P 会被拿走，运行时再找一条 M 来顶上——线程数会涨。
-- **真·CPU 工作。** 一万个 goroutine 各自算圆周率，还是只有 `GOMAXPROCS` 个在跑，剩下的在本地队列里排队。调度本身也要占周期。
+所以「万并发」成立的前提几乎总是：**大多数 goroutine 大部分时间在等，而不是在算。**
 
-所以「万并发」成立的前提几乎总是：**大多数 goroutine 大部分时间并不在跑，而是在等。** 等的是网络、锁、channel，不是 CPU。等得其所，才轻；等错了地方（占着线程空转，或纯算力），就不轻。
+## 为什么需要第三个实体
 
-取消树、超时怎么从入口传到叶子，是另一篇文章的事。调度器不管你为什么停，只管停了之后 CPU 给谁。
+把 G 直接映射到线程的两种朴素做法都在规模上翻车，P 是为了修掉它们共同的那个缺陷。
 
-## 两种会失败的调度
+| 模型 | 失败点 | GMP 的答案 |
+| --- | --- | --- |
+| 一对一：每个 G 一条 OS 线程 | 连接数 = 线程数，创建、切换、栈全按线程付；C10K 就死在这 | G 是用户态对象，数量与 M 解耦 |
+| M:N + 单条全局队列（Go 1.0 那一代） | 每次 `go`、每次唤醒、每次再调度都抢 `sched.lock`；核越多锁越热，缓存行来回失效；刚唤醒的消费者还可能跑到别的核上 | 每张 P 一条本地队列 + `runnext` 插队槽 |
+| 两者共有 | 线程被 syscall 挂起时，排在它身后的 G 一起停 | 调度权从线程上剥离，可 `handoffp` 转给别的 M |
 
-把 goroutine 映射到线程，最朴素的两种办法都会在规模上翻车。这也是后来多出来一个 P 的原因。
+第三行才是 P 的由来：**把「线程」和「跑 Go 代码的资格」拆成两样东西。**
 
-**一对一：每个 goroutine 一条 OS 线程。**
+## G、M、P：谁管什么
 
-创建、切换、栈，全部按线程付。一万个连接就一万条线程，内核调度器先受不了：每个线程一个内核栈、一套内核结构，切换要陷入内核。Go 想要的「函数调用一样起一个并发任务」在这个模型里不成立。
-
-更麻烦的是阻塞。线程在 `read` 里睡着是内核的事，没问题；但你为每个连接准备一条线程，等于把「连接数」和「线程数」绑死。C10K 当年就是这么死的。
-
-**M:N，但全局一把锁、一条队列。**
-
-Goroutine 放到全局 runqueue，空闲线程来取。早期 Go（1.0 那一代）接近这个形状。逻辑正确，规模不行。
-
-所有 `go f()`、所有唤醒、所有「我执行完了要下一项」，都要抢同一把调度锁。核一多，锁本身先成为瓶颈——不是计算慢，是大家排队进临界区。缓存行来回作废，P99 被锁尾延迟打穿。
-
-队列在一个地方，还有局部性的问题：刚唤醒的消费者，最好就在生产者这条线程上接着跑，数据还在 L1。全局队列做不到这一点。
-
-所以目标变成三句话：
-
-1. 不要为每个 G 准备一条线程
-2. 不要让所有核抢一把调度锁
-3. 线程被系统调用堵住时，别让这条核上的其余 goroutine 一起停
-
-第三句把「线程」和「调度权」拆开了。这就是 P。
-
-## G、M、P：三样东西各管什么
-
-Go 1.1 起的调度器（设计见 [Scalable Go Scheduler Design](https://golang.org/s/go11sched)）把实体拆成三个。
-
-**G（goroutine）** 是要被跑的那份工作。栈、程序计数器、状态（`_Grunning` / `_Grunnable` / `_Gwaiting` / `_Gsyscall`……）。你 `go f()` 得到的就是一个 G。它可以换一条线程接着跑，对用户代码来说是同一条 goroutine。
-
-**M（machine）** 是一条 OS 线程。真正能被 CPU 执行的是 M。M 可以没有 G（闲着），也可以没有 P（堵在系统调用里）。M 自己还有一个 `g0`，那是运行时的系统栈，`schedule`、扩栈、GC 辅助会切到上面去。
-
-**P（processor）** 不是 CPU，是**跑 Go 代码所需的那张门票**。本地 runqueue、内存分配器的 `mcache`、sudog 缓存、计时器堆，都挂在 P 上。`GOMAXPROCS` 就是 P 的数量。没有 P，M 不能执行用户 Go 代码。
-
-关系是：
+Go 1.1 起的调度器（设计见 [Scalable Go Scheduler Design](https://golang.org/s/go11sched)）用三个实体分摊职责。
 
 ```text
-M（线程）  ──绑定──▶  P（门票 + 本地状态）  ──执行──▶  G（goroutine）
+   M（OS 线程，数量可比 P 多）
+   │  自带 g0 系统栈：schedule、扩栈、GC 辅助都在上面跑
+   │  持有 P 才能执行用户 Go 代码
+   ▼
+ ┌────────────────────────────────────────────────┐
+ │ P（门票 + 本地状态）                            │
+ │   runnext · runq[256] · mcache · timer 堆      │
+ └────────────────────────────────────────────────┘
+   │ execute
+   ▼
+   G（goroutine）：栈、PC、状态（_Grunnable / _Grunning / _Gwaiting / _Gsyscall）
 ```
 
-任意时刻，正在跑 Go 代码的 M 至多 `GOMAXPROCS` 个，因为 P 就那么多。M 的数量可以更多：堵在 syscall 里的 M 不持有 P，另一条 M 可以把这张 P 拿走继续干活。
+P 不是 CPU，是**跑 Go 代码所需的那张门票**：没有 P 的 M 只能卡在内核里，或者睡在空闲 M 列表上。
 
-**P 为什么必须存在？**
+| | 数量 | 挂着什么 | 上限 |
+| --- | --- | --- | --- |
+| G | 十万级无妨 | 栈、PC、等待项 | 内存 |
+| M | 随「同时卡住的内核调用数」增长 | g0、信号栈、当前 G | `sched.maxmcount`，`schedinit` 里写死 10000，越界 `throw("thread exhaustion")` |
+| P | `GOMAXPROCS` | 本地队列、`mcache`、timer 四叉堆 | 等于真并行度 |
 
-如果只有 G 和 M，本地队列、分配器缓存就得挂在 M 上。M 一进 syscall 被内核挂起，这些状态跟着沉睡，别的线程用不了；或者全部改回全局锁。P 把「调度权和缓存」从「线程」上揭下来：线程可以睡，门票转给醒着的人。
+只有 G 和 M 的话，本地队列和分配器缓存就得挂在 M 上：线程一进 syscall 被内核挂起，这些状态跟着沉睡，别人用不了。P 让线程可以睡，门票转给醒着的人。
 
-可以把它想成停车场的通行证。车（M）可以很多，通行证（P）只有 `GOMAXPROCS` 张。没有通行证，车不能在「跑 Go 代码」这条路上开，但可以停在内核的 syscall 停车场里干等。
+`GOMAXPROCS` 从 Go 1.5 起默认等于逻辑 CPU 数。**Go 1.25 起，Linux 上默认还会考虑 cgroup CPU 限额**，并由 `sysmon` 每秒最多更新一次（`GODEBUG=containermaxprocs=0` 关掉 cgroup 感知，`updatemaxprocs=0` 关掉动态更新）；1.24 及更早只看 CPU 数和亲和性，64 核机器上给 2 核配额的容器照样拿到 64 张 P。改它是在改**并行度**，不是在改「能起多少 goroutine」。
 
-`GOMAXPROCS` 从 Go 1.5 起默认等于逻辑 CPU 数（`runtime.NumCPU()`）。容器里如果只给了 2 个 CPU 配额、机器却有 64 核，1.24 及更早仍会按 64 来——那是另一笔账单，1.25 起才默认看 cgroup 限额。应用里可以用环境变量或 `runtime.GOMAXPROCS(n)` 改。改它是在改**并行度**，不是在改「能起多少 goroutine」。
+## 三处可运行队列
 
-调度循环本身很短。一条 M 持有一张 P，反复做：
+每张 P 有三处放可运行 G 的地方，快路径完全不碰全局锁。
 
 ```text
-schedule
-  └─ findRunnable     找到一个 _Grunnable 的 G
-       └─ execute     把 G 接到这条 M 上，gogo 跳进去
-            └─ G 跑，直到阻塞、结束、或被抢占
-                 └─ 回到 schedule
+ go f() / goready(gp)
+        │
+        │ next=true                    runqput 慢路径（本地满）
+        ▼                                     │
+  ┌─ runnext ─┐  1 个槽，runqget 先看它        │  runqputslow：队头 128 个
+P─┤           │                               ▼  + 当前这个 = 129 个一次搬走
+  └─ runq[256] 环形，FIFO，本 P 无锁存取 ──▶ 全局 runq（sched.lock 保护）
 ```
 
-`findRunnable` 和 `execute` 是运行时里的真名。后面几节就是 `findRunnable` 按什么顺序找活。
+容量 256 是写死的；溢出不逐个进全局队列，而是一次搬 129 个——摊薄锁开销，同时留一半在本地保住局部性。
 
-## 本地队列、全局队列、runnext
+`runnext` 只有 1 个槽，因为它解决的是一个很窄的问题：
 
-每个 P 有三处放可运行 G 的地方。
+- 生产者-消费者太常见。`ch <- v` 唤醒的对端立刻在同一张 P 上跑，数据还在 L1；丢到队尾的话，中间可能插进几十个不相干的 G。
+- `execute` 从 `runnext` 取 G 时继承当前时间片（`inheritTime`），不推进 `schedtick`——当成同一段工作的延续，而不是一次新调度。
+- 它不是优先级队列：只看「是不是刚被这张 P 造出来或喊醒」，不看 goroutine 有多重要。
 
-**本地 runqueue。** 长度 256 的环形队列，挂在这张 P 上。当前 M 往里面放、从里面取，快路径无锁。这是调度器为了**不抢全局锁**付的结构代价：工作默认待在产生它的那颗核附近。
+## findRunnable 的查找顺序
 
-**全局 runqueue。** 所有 P 共享，受 `sched.lock` 保护。本地队列满了、以及需要公平性的溢出，会走到这里。它是慢路径，不是主路径。
-
-**runnext。** 每个 P 一个槽，只能放 1 个 G。新 `go f()` 出来的 G、以及刚被唤醒、很像「生产者刚喊醒的消费者」的那个 G，优先塞进这里。下一次 `runqget` 先看它。
+公平性和局部性的取舍全写在这个顺序里，`findRunnable` 每次调度都按它走一遍：
 
 ```text
-P
-├─ runnext     下一个就跑它（至多 1 个）
-├─ runq[256]   本地队列，FIFO
-└─ （满了）──▶ 全局 runq
+findRunnable()
+ 1. trace reader / GC worker                      有标记任务先领
+ 2. pp.schedtick%61 == 0 && 全局队列非空 → 取 1 个   ← 写死的公平性阀门
+ 3. 本地：runqget(pp)                             runnext → runq 队头
+ 4. 全局：globrunqgetbatch(len(runq)/2)            一次搬 128 个进本地
+ 5. netpoll(0) 非阻塞                             有 waiter 且没人正在 poll 时才做
+ 6. stealWork()                                   4 轮随机扫 allp
+ 7. GC idle mark                                  能干标记活就不还 P
+ 8. 都没有 → 交还 P、stopm                        必要时做一次阻塞 netpoll
 ```
 
-为什么要 runnext，而不是一律进本地队列尾部？
+第 2 步的 61 防的是饿死：两个 G 不停 `go` 对方就能永远占满本地队列，偶尔强制从全局取一个，溢出去的工作才有机会跑。第 8 步那次阻塞 netpoll 用一次睡眠同时等网络和最近的 timer。
 
-因为生产者-消费者太常见：
+## 工作窃取：偷一半，随机起点
 
-```go
-func produce(ch chan int) {
-    for i := 0; i < 10; i++ {
-        ch <- i // 可能唤醒对面那个 G
-    }
-}
-```
-
-发送方把对面从等待里捞起来之后，最好**立刻在同一张 P 上跑消费者**。数据还在缓存里，像一次函数调用。若把消费者丢到队列尾部，中间可能插进几十个不相干的 G，局部性没了。
-
-runnext 就是这个「插队位」。`execute` 从 runnext 拿到 G 时，可以继承当前时间片（`inheritTime`），不刷新 `schedtick`——当成同一段工作的延续，而不是一次新的调度。
-
-本地队列满了怎么办？不能无限涨，否则又变成「每张 P 一条无界链表」。满时 `runqput` 走慢路径：把本地队列的大约一半，连同放不进去的那个 G，批次倒进全局队列。一半留在本地，一半分给别人——既给别的 P 可取的工作，又不用每次 `go` 都碰全局锁。
-
-`findRunnable` 取工作的顺序，大意是：
+本地队列消掉了锁竞争，代价是不平衡；窃取用「一次搬一半」把再平衡的成本摊薄。
 
 ```text
-1. 每隔 61 次调度，先看一眼全局队列（防止本地互相生孩子、饿死外人）
-2. 本地：先 runnext，再 runq 队头
-3. 全局队列
-4. 非阻塞地问一下 netpoller（有没有刚就绪的网络 G）
-5. 去别的 P 上偷
-6. 还没有：交还 P，M 去睡觉；必要时做一次阻塞的 netpoll
+偷之前                            偷之后（runqgrab: n = n - n/2，从队头那端拿）
+P1 runq: [g1 g2 g3 g4 g5 g6]      P1 runq: [g4 g5 g6]      ← 较新的留给原主
+P2 runq: []（空转中）             P2 runq: [g1 g2] ＋ 直接开跑 g3
 ```
 
-第 1 步那个 61 是写死的公平性：两个 G 如果不停 `go` 对方，可以永远占满本地队列。偶尔强制从全局拿一个，让溢出去的工作有机会跑。
+偷 1 个则下次还得再来，跨核 cache miss 摊不薄；偷光则对方立刻回头偷你，来回抖动。取一半让双方都有活干。
 
-注意：**机制是「分片队列 + 一个插队槽」；结果是「大多数调度不碰全局锁，且刚唤醒的 G 常在同一核上接着跑」。** 不要把 runnext 理解成优先级队列，它不看 goroutine 的重要性，只看「是不是刚被当前这张 P 造出来 / 喊醒」。
+- **从队头那端拿。** 那些入队最早，和原主当下正在做的事关系最远。
+- **`runnext` 最后才考虑。** 队列里没东西可偷时才动它，且先 `usleep(3)`（低精度定时器平台上改成 `osyield`）让原主有机会自己调度它，避免同一个 G 在两张 P 之间被推来推去。
+- **随机起点，不是 0、1、2 顺序扫。** `stealOrder` 用与 P 个数互质的步长走一个伪随机排列，顺序扫会让所有闲 P 挤向同一张忙 P。
+- **spinning M 有配额。** 条件是 `2*nmspinning < gomaxprocs - npidle`，即 spinning 的 M 不超过忙碌 P 的一半，免得 `GOMAXPROCS` 很大而实际并行度很低时一堆线程烧 CPU。
 
-## 工作窃取：偷一半
+配套的是 `wakep`：只在「有空闲 P 且当前没有 spinning M」时才喊醒线程；而那条找到活、退出 spinning 的 M 有责任再补一个 spinning，否则会出现「大家都以为有人在找、其实没人在找」的空窗。spinning 是 M 在 `findRunnable` 里多看几眼别人的队列和 timer，不是用户 goroutine 在空转。
 
-本地队列解决了锁，制造了不平衡。一张 P 在狂 `go`，旁边一张 P 刚把自己的队列跑空。若空着的那个去睡，核就闲了；若所有空闲者都去抢全局锁，又回到第二种失败设计。
+## syscall：P 会被夺走
 
-于是：空闲的 P **去别的 P 的本地队列里偷**。
-
-偷多少？大约一半。偷哪个？从对方队列里年纪较大的那一端拿（先入队、本来下一个就要跑的那些），让对方留下较新的——对方刚产生的工作更可能和对方正在做的事有关。
-
-「偷一半」不是拍脑袋。偷 1 个，下次还得再偷，来回的 cache miss 摊不薄；偷光，对方马上又空，立刻回头偷你，抖动。一半让双方都有活干，一次搬运摊销开销。
-
-偷的时候还会看对方的 runnext。但 runnext 里那个 G 可能正要被对方跑，立刻偷走会把一次「函数调用式」的切换变成跨核搬家。实现上对 runnext 更保守：队列里没东西可偷时才考虑它，并且会稍微退让一下，避免两个 P 把同一个 G 推来推去。
-
-偷的对象不是按 0、1、2… 扫。那样所有闲 P 会挤向同一张忙 P。实现是随机起点、步长和 P 的个数互质，走过一个伪随机排列。目的只有一个：别形成羊群。
-
-还有一个配套：**spinning M**。
-
-工作刚被放进某张 P 的本地队列时，别的核不一定看得见，而且唤醒一条沉睡的线程本身就贵。如果每次 `go` 或 ready 都立刻唤醒一条 M，生产者自己下一刻也可能没活了，于是这条新 M 立刻再睡——线程抖。
-
-调度器的折中写在 `wakep` 的注释里，可以缩成两条：
-
-- 有空闲的 P、且**当前没有 spinning 的 M**，才再喊醒一条 M。这条 M 先标成 spinning，去各处找活。
-- 已经有人在转，就不再喊。那个 spinning 的人找到活、停止 spinning 时，有责任再补一个 spinning（否则会出现「大家都以为有人在找、其实没人找」的空窗）。
-
-spinning 不是用户 goroutine 在空转，是 M 在 `findRunnable` 里多看几眼别人的队列和计时器，还没睡。数量也有上限，大致不超过忙碌 P 的一半，免得 `GOMAXPROCS` 很大、实际并行度很低时，一堆线程在那烧 CPU。
-
-找不到活的 M 最终还是会把 P 交回空闲链表，自己 `stopm` 睡掉。P 还在，M 可以睡。这又回到 P 存在的理由：通行证可以暂时没人拿。
-
-## 系统调用、cgo、阻塞：P 被抢走
-
-用户代码里的「阻塞」不是同一种阻塞。调度器只对其中一种特殊处理：**会卡住 OS 线程的那种**。
-
-channel、`sync.Mutex`（竞争时）、`time.Sleep`：G 走到 `gopark`，状态变成 `_Gwaiting`，从 runqueue 消失。M 和 P 还在，立刻 `findRunnable` 换下一个 G。**G 睡着，M+P 继续工作。** 这是「万并发」能成立的主路径。
-
-`read` 一个本地文件、慢 DNS、cgo 里调了一下阻塞的 C 库：这条 M 会进入操作系统，内核把线程挂起。如果此时还握着 P，这张通行证上的本地队列、这颗核的配额，全部陪着睡。
-
-所以进入 syscall 时，运行时做的第一件事不是「再开一条线程」，而是**先把 P 的状态改成 `_Psyscall`，把 P 从 M 上摘下来**（`entersyscall`）。M 仍记得 `oldp`，方便系统调用很快返回时走快路径把同一张 P 拿回来（`exitsyscall`）。
+用户代码里的「阻塞」不是一种。调度器只对**会卡住 OS 线程的那种**做特殊处理。
 
 ```text
-进入 syscall：
-  G  ──▶ _Gsyscall
-  M  仍卡在这一次内核调用里
-  P  ──▶ _Psyscall，暂离 M（oldp 里留着快路径）
-
-syscall 很快返回：
-  M 试图用 oldp 把 P 抢回来，G 接着跑
-
-syscall 太慢 / 明确会堵：
-  sysmon 或 entersyscallblock 把 P 真正拿走（handoffp）
-  另一条 M 绑上这张 P，继续跑它本地队列里的 G
-  原来的 M 回来时发现 P 没了，得重新申请一张；没有就排队
+时间 ↓   M1                              P                        另一条 M
+       entersyscall             _Prunning → _Psyscall
+       （记下 oldp）            从 M1 摘下，本地队列原样留着
+       陷入内核 read ……
+                                ← sysmon 的 retake 巡到
+                                   handoffp(P) ──────────▶ M2 绑上 P，接着跑它的本地队列
+       read 返回
+       exitsyscall：试 oldp，失败
+       → 申请空闲 P；拿不到就把 G 丢进全局队列，自己 stopm
 ```
 
-`handoffp` 是真名：P 从这条 M 手里交出去之后，必须保证「如果这张 P 上还有活、或全局还有活、或需要有人去 netpoll」，就得有另一条 M 来接。没闲着的 M 就 `newm` 造一条。
+卡住的是线程，不是这颗核上的 Go 调度：P 的数量不变，M 的数量跟着**同时卡住的内核调用数**涨。两条状态线并排看更清楚：
 
-这就是「阻塞 syscall 会涨线程」的机制。P 的数量不变，M 的数量跟着**同时卡住的内核调用数**涨。涨出来的 M 在 syscall 返回后，若没有 P 可绑，会进入空闲 M 列表，下次还能复用。运行时默认有线程数上限（`sched.maxmcount`，一万量级），防的就是「每个 G 都堵在一个文件读上」时 fork bomb 式地造线程。
+```text
+P：_Prunning ──entersyscall──▶ _Psyscall ──retake(CAS)──▶ _Pidle ──handoffp──▶ _Prunning（在 M2 上）
+G：_Grunning ────────────────▶ _Gsyscall ──────────────────────────────────▶ _Grunnable（回队列排）
+M1：跑 Go 代码 ──────────────▶ 卡在内核，无 P ─────────────────────────────▶ 抢 P 或 stopm
+```
 
-cgo 走同一套门：出 Go 进 C 之前 `entersyscall`，C 返回再 `exitsyscall`。C 函数若长时间占着 CPU 或阻塞，效果和慢 syscall 一样——M 被占用，P 可能被抢走。区别是 C 代码里没有抢占点，运行时对这段时间几乎看不见。
+G 全程没有丢，只是换了一条线程继续；M1 在这段时间里对调度器而言等于不存在。
 
-有一类 syscall 一开始就知道会堵，走 `entersyscallblock`，P 立刻 `handoffp`，不等 sysmon 来收。短 syscall 则赌一把快路径：保留 P 一小段时间，回来还是自己的核、自己的 `mcache`。
+- **短 syscall 赌快路径。** `exitsyscall` 优先用 `oldp` 把同一张 P 抢回来，`mcache` 和局部性都还在。
+- **`retake` 的条件。** P 在 syscall 里跨过一个 sysmon tick（至少 20µs）后，只要「本地队列非空」、或「没有空闲/spinning 的 M 能顶上」、或「已经堵了 10ms」，就夺走并 `handoffp`。
+- **明知会堵的走 `entersyscallblock`**，立刻 `handoffp`，不等 sysmon 来收。
+- **`handoffp` 负责兜底**：如果这张 P 还有活、全局还有活、或需要有人去 netpoll，就必须有 M 接手，没有闲 M 就 `newm` 造一条。
+- **cgo 走同一套门。** `entersyscall` → C 代码 → `exitsyscall`。C 里没有抢占点，这段时间运行时几乎看不见。
 
-**机制是「syscall 期间 P 可被夺走」；结果是「卡住的是线程，不是这颗核上的 Go 调度」。** 你在 `runtime.NumGoroutine()` 里看见的数字，和 `runtime.NumCPU()`、和实际 OS 线程数，是三个数。线程数在 `top` 里涨，通常是 cgo 或阻塞 syscall，不是 goroutine 太多。
+## sysmon 与抢占：从协作到信号
 
-## sysmon 和抢占：从协作到信号
+时间片 10ms（`forcePreemptNS`）是 `sysmon` 的愿望；G 真正让出 P，要么自己 `gopark`，要么在一个安全点被按回调度器。
 
-谁来夺走 `_Psyscall` 的 P？谁来打断一个算了很久的 G？不是每个 M 自己，是一条**不绑 P 的特殊 M**：`sysmon`。
+`sysmon` 由 `newm(sysmon, nil, -1)` 在启动时拉起，不持有 P，不参与 `schedule` 循环：睡 20µs 起，连续空转约 1ms 后指数加倍，上限 10ms。每轮扫一遍 `allp`，做 `retake`、抢占跑满时间片的 G、超过 10ms 没 poll 就补一次 `netpoll`、查死锁、催 GC，1.25 起还顺手更新 `GOMAXPROCS`。
 
-进程启动时 `newm(sysmon, nil, -1)` 拉起它。它不参与普通的 `schedule` 循环，自己睡醒一轮、扫一遍所有 P。空闲时睡眠间隔从 20µs 指数退到 10ms，免得空转烧电。
+抢占请求怎么送到，1.14 是分界线：
 
-它每轮主要干几类事：
+| | 请求方式 | 生效位置 | 热循环 |
+| --- | --- | --- | --- |
+| 1.14 前（协作式） | `gp.stackguard0 = stackPreempt` | 函数序言的栈溢出检查误判，走进运行时 | 抢不动 |
+| 1.14 起（＋异步） | 追加一个 `SIGURG`（`sigPreempt`） | 信号处理器在 `gsignal` 栈上改返回地址，注入 `asyncPreempt` | 能打断 |
 
-- 看看有没有 P 卡在 `_Psyscall` 太久，该不该 `retake`
-- 看看有没有 G 在同一张 P 上连续跑过了时间片（10ms，`forcePreemptNS`），该不该抢占
-- 必要时催一下 netpoller、检查死锁、催 GC
-
-`retake` 也是真名。对卡在 syscall 里的 P，它 CAS 把状态改成空闲，再 `handoffp`。对跑太久的 G，它先发一个协作式请求：把 `gp.stackguard0` 写成一个哨兵值（`stackPreempt`），下一次函数序言里的栈溢出检查会误以为要扩栈，于是走进运行时，发现是抢占，把 G 放回队列。
-
-这就是 Go 1.14 之前的世界：**协作式抢占**。抢占发生在函数调用边界。对普通代码够用——Go 函数调用很密。对下面这种不够用：
+「抢不动」的后果很具体：
 
 ```go
 func freeze() {
     n := 0
     for {
-        n++ // 没有函数调用
+        n++ // 没有函数调用，就没有序言，看不见 stackguard0 哨兵
     }
 }
 ```
 
-没有调用，就没有序言，就看不见 `stackguard0`。这个 G 会一直占着那张 P。GC 的 STW 要等所有 P 到达安全点，于是**整个程序冻在一次「没有函数调用的热循环」上**。这不是理论，是 1.14 之前生产环境里真实出现过的事故。
+1.14 之前这个 G 会一直占着那张 P，而 GC 的 STW 要等所有 P 到达安全点——**整个程序冻在一个没有函数调用的热循环上**，这是当年生产环境里真实出现过的事故。1.14 之后信号能改 PC，多数用户代码可被异步打断；但运行时内部、部分汇编、持有运行时锁的区间仍标记为不可抢占。`GODEBUG=asyncpreemptoff=1` 只用于排查，不是调优手段。
 
-Go 1.14 起补了**异步抢占**。`sysmon` 在协作式请求之外，给目标 M 发一个信号（Unix 上是 `SIGURG`，选它是因为和 libc、调试器冲突少）。信号处理器跑在 M 的 `gsignal` 栈上，检查当前 PC 是否在可抢占指令序列；如果是，就改返回地址，让这段代码「返回」进 `asyncPreempt`，再进入调度器。热循环没有函数调用，也能被打断。
+## netpoller：等网络不占 M+P
 
-```text
-1.14 之前：只在函数调用处看哨兵 → 热循环可以冻住 STW
-1.14 之后：哨兵 + SIGURG 改 PC → 多数用户代码可异步抢占
-```
-
-不是所有位置都能抢。运行时内部、某些汇编、持有运行时锁的区间会标成不可抢占。大块内存拷贝也曾是盲区，后来陆续补。`GODEBUG=asyncpreemptoff=1` 能关上异步抢占，只用于排查，不是调优手段。
-
-所以时间片 10ms 是 **sysmon 的愿望**；G 真正让出 P，要么自己 `gopark` / 调用边界看到哨兵，要么被信号按进调度器。愿望和实现之间隔着一层「当前 PC 安不安全」。
-
-## Netpoller：阻塞 I/O 不占 M+P
-
-网络是 goroutine 最多的那种「等」。如果每次 `Read` 都按文件 syscall 处理，每个连接一条 M，GMP 退回一对一。
-
-Go 的 net 包把 socket 设成非阻塞，真正的等待交给 **netpoller**：Linux 上是 epoll，BSD / macOS 上是 kqueue，Windows 上是 IOCP。它是运行时的一部分，不是你在应用里开的那条 event loop。
-
-一次 `conn.Read` 大致是：
+网络是 goroutine 最多的那种「等」，它必须走 park 而不是走 syscall 路径，否则 GMP 退回一对一。
 
 ```text
-用户 G 调 Read
-  └─ 非阻塞 recv，立刻有数据 → 返回
-  └─ 没有数据：
-       把 G 登记到 netpoller（fd → G）
-       gopark                    // G 睡着，状态 _Gwaiting
-       M+P 去 findRunnable       // 这张票继续跑别人
+conn.Read(buf)
+ ├─ 非阻塞 recv 有数据 → 直接返回，一次调度都不发生
+ └─ EAGAIN：
+      netpoller 登记 fd → G   （Linux epoll / BSD kqueue / Windows IOCP）
+      gopark：G 变 _Gwaiting，从队列里消失
+      M 回到 findRunnable，P 没动 ──▶ 这张门票继续跑别人
+    fd 就绪：netpoll 取回 G → goready → 进某张 P 的队列
 ```
 
-fd 可读时，netpoller 把对应的 G 捡回来，`goready` 丢进某张 P 的队列。`findRunnable` 自己也会非阻塞地问一把 netpoll，免得网络就绪的 G 还要等一轮；所有 P 都忙时，`sysmon` 会催。最后实在没用户 G 可跑了，M 在交还 P 之前还可能做一次**阻塞的** netpoll，用这一次睡眠同时等网络和最近的 timer。
+等 I/O 的 G 占着的只有 epoll 里一项和一份小栈，这是「每连接一个 goroutine」能上万的全部秘密；非阻塞是前提，细节见 [为什么 IO 多路复用必须搭配非阻塞 IO](/blog/2026/09/16/io-multiplexing-nonblocking/)。
 
-这就是「一万个连接、每连接一个 goroutine」可以成立的原因：**等 I/O 的 G 不占 M，更不占 P。** 占着的是 epoll 里的一项和一份较小的栈。和「一条线程 + 回调」比，你把回调写成了顺序代码，运行时在 park / unpark 处帮你把栈活下来。
-
-timer 也挂在 P 上（每张 P 一棵四叉堆）。`time.Sleep`、`time.After` 到期，本质是「把那个 G ready」，不是再开线程。`findRunnable` 和 `sysmon` 都会看 timer。deadline 和 netpoll 常常是一次等待。
-
-和 syscall 路径对比一下，界限就清楚了：
+四种等待的账单完全不同：
 
 | 等待 | G | M | P |
 | --- | --- | --- | --- |
-| channel / Mutex | park | 继续跑别人 | 继续 |
-| `net.Conn`、Listener | park，挂到 netpoller | 继续 | 继续 |
-| `time.Sleep` | park，挂到 P 的 timer | 继续 | 继续 |
-| 阻塞文件 syscall、慢 cgo | `_Gsyscall` | 卡在内核 / C | 可被 retake |
+| channel、竞争中的 `sync.Mutex` | `gopark` → `_Gwaiting` | 换下一个 G | 不动 |
+| `net.Conn` 读写、Listener | `gopark`，挂进 netpoller | 换下一个 G | 不动 |
+| `time.Sleep`、deadline | `gopark`，挂进 P 的 timer 堆 | 换下一个 G | 不动（timer 可被窃取最后一轮取走） |
+| 阻塞文件 syscall、慢 cgo | `_Gsyscall` | 卡在内核 / C 里，线程数 +1 | `_Psyscall`，可被 `retake` |
 
-写 `net/http` 服务时你很少碰到第四行。自己用 `os.File` 对套接字做阻塞读、在 cgo 里 `poll`，才会把模型用错。
+前三行是主路径，第四行是例外。`net/http` 服务几乎只走前三行；自己拿 `os.File` 对套接字做阻塞读、或在 cgo 里 `poll`，才会掉进第四行。
 
-## 串起来：一次请求在调度器里怎么走
+## 一次请求在调度器里怎么走
 
-假设 `GOMAXPROCS=4`，一个 HTTP 服务处理「读 socket、查一次本地文件、回包」。四个 G 同时在忙，调度器里实际发生的事可以按时间摊开。
-
-入口：`net/http` 的 listener 已经 park 在 netpoller 上。连接到来，netpoller 把那个 G ready。某张空闲或正在 `findRunnable` 的 P 拿到它，`execute` 跳进去。这个 G 里 `go handle(conn)`，新 G 进当前 P 的 runnext——下一拍就跑 handler，不绕全局队列。
-
-handler 里 `conn.Read`：没数据就 `gopark`。G 挂到 fd 上，M+P 立刻去跑 runnext 或本地队列里别的人。此时：
+`GOMAXPROCS=4`，一个「读 socket → 读本地文件 → 回包」的 handler，在调度器里的轨迹是：
 
 ```text
-G_handler   _Gwaiting，在 netpoller 里
-M           还在，绑着原来那张 P
-P           跑队列里下一个 G，mcache、timer 都还在
+accept 的 G park 在 netpoller
+ └─ 连接到来 → goready → 某张 P → execute
+     └─ go handle(conn)：新 G 进当前 P 的 runnext，下一拍就跑，不绕全局队列
+         ├─ conn.Read 无数据 → gopark；M+P 立刻跑本地队列里下一个
+         ├─ 数据到达 → findRunnable 第 5 步捞回来（理想情况回到原来那张 P）
+         ├─ os.File.Read 读盘 → entersyscall；超过 sysmon 的耐心 → retake + handoffp，线程数 +1
+         ├─ 回包：非阻塞 write，多半不堵线程
+         └─ G 退出 → _Gdead；栈若不等于 startingStackSize 就释放，g 进 gFree，allgs 不缩
 ```
 
-数据到了，`findRunnable` 或 `sysmon` 从 netpoll 捞到 `G_handler`，再丢回某张 P。理想情况还是原来那张——局部性还在；忙的话被别人偷走也正常。
+同一时间旁边那个算 JSON 的 G 连续占满 10ms，会被 `stackPreempt` + `SIGURG` 按回队列，P 转去跑刚从 netpoller 醒来的 handler。整条链路上真正占着 P 的，只有「正在跑 Go 代码」的那些瞬间。
 
-接下来 handler 打开一个文件做 `Read`。这是阻塞 syscall。`entersyscall` 把 P 标成 `_Psyscall`。读盘若超过 sysmon 的耐心，`retake` + `handoffp`：P 交给另一条 M，原来的 M 继续堵在 `read` 上。进程的线程数 +1，P 的数量不变。文件返回后这条 M 发现 P 没了，得重新申请；申请到就 `exitsyscall` 接着跑，申请不到就等。
+## 避坑
 
-回包又是一次 net 写，多半不堵线程。handler 返回，G 进入 `_Gdead`，栈若还是起始大小就留着复用，`g` 对象进自由列表，不从 `allgs` 里删掉。
+**1. 忙等。** `for { if atomic.Load(&flag) == 1 { break } }` 在 1.14 之前能卡死 STW，之后也要吃满一个 10ms 时间片。有等待语义就用 channel 或 `Mutex`；`runtime.Gosched()` 能「治好」的问题，说明原语选错了。不可抢占的热循环还会拖长 STW 的停机阶段：`/sched/pauses/stopping/gc:seconds` 的分位数逼近 `/sched/pauses/total/gc:seconds` 时，时间就是花在等 P 到达安全点上。
 
-同一段时间里，旁边如果有个 G 在算 JSON，连续占着一张 P 超过 10ms，`sysmon` 先写 `stackPreempt`，再补一个 `SIGURG`。这个 G 被按回全局或本地队列，P 去跑别人——包括刚刚从 netpoller 醒过来、在等 CPU 的 handler。
+**2. 线程数无端上涨。** 连接数和 `GOMAXPROCS` 都没变，`top` 里线程数却在涨，答案基本在阻塞文件 I/O 和 cgo：P 被 `handoffp` 走了，总得有条线程来绑它。涨到 `maxmcount` 会直接 `throw("thread exhaustion")`。排查顺序是 `GODEBUG=schedtrace=1000`（看 `threads` 与 `idlethreads`）→ pprof 的 threadcreate → 数 cgo 调用点。
 
-整条链路里，真正占着 P 的只有「正在跑 Go 代码」的那些瞬间。等网络、等 channel 的 G 可以成千上万；等文件 syscall 的 G 会按个数长出 M；纯计算的 G 按时间片轮流用那 4 张 P。三种等待不是一种账单。
+**3. 把 `GOMAXPROCS` 当连接配额。** 它是并行度上限，不是 goroutine 配额；调小它是在限 CPU，不是在限连接。判断「是 G 太多还是 P 太少」看排队时间，别看 `NumGoroutine()`：
 
-## 模型推出来的几条结论
+```go
+import "runtime/metrics"
 
-这些不是调参手册，是同一套机制的推论。
+var samples = []metrics.Sample{
+	{Name: "/sched/goroutines:goroutines"},
+	{Name: "/sched/gomaxprocs:threads"},
+	{Name: "/sched/latencies:seconds"}, // 直方图：G 进入 _Grunnable 到真正开跑的等待，Go 1.20 起
+}
 
-**`GOMAXPROCS` 管的是并行度，不是 goroutine 配额。** 它等于 P 的数量，也就是同时执行用户 Go 代码的 M 的上限。改大它，纯计算能多用几颗核，也会让 GC、窃取、缓存失效更热闹。改小它，是在限 CPU，不是在限连接数。把连接数和 `GOMAXPROCS` 当成一回事，是还停在一对一模型里。
+// p99 明显高于个位数微秒，说明可运行的 G 在排队等 P，不是在等 I/O。
+func schedPressure() (live, procs uint64, p99 float64) {
+	metrics.Read(samples)
+	// histQuantile 略：按 Float64Histogram 的 Counts / Buckets 累加到目标分位。
+	return samples[0].Value.Uint64(), samples[1].Value.Uint64(),
+		histQuantile(samples[2].Value.Float64Histogram(), 0.99)
+}
+```
 
-**G 的数量可以远大于 P，前提是它们在等而不是在算。** 一万个 G 堵在 `Read` 上，是一万份小栈 + netpoller 里一万个 fd，P 仍然可能很闲。一万个 G 各自 `for { n++ }`，是一万个要轮转的时间片，P 被占满，延迟、GC STW、调度开销一起上来。看程序「并发高不高」，先看 G 在等什么。
+较新的运行时还提供 `/sched/threads/total:threads` 和 `/sched/goroutines/not-in-go:goroutines`，正好对应第 2 条；用 `metrics.All()` 先确认当前版本有没有这两项。
 
-**不要在 Go 里写忙等。** `for { if atomic.Load(...) == 1 { break } }` 在 1.14 之前能把 STW 卡死；之后也能把一张 P 吃满 10ms 一个时间片。有等待语义就用 channel、`Mutex`。`runtime.Gosched` 解决不了就说明你在用错原语。spinning 是运行时给 M 找活用的，不是给你的 goroutine 用的。
+## 结论
 
-**阻塞 syscall 和 cgo 会长出额外的 M。** P 被 `handoffp` 走了，总得有一条线程来绑它。连接数没变、`GOMAXPROCS` 没变，`top` 里线程数上去了，去查文件 I/O 和 cgo。线程涨到上限会直接 `throw("thread exhaustion")`。这不是调度器坏了，是「卡住的内核调用数」这个维度被你用满了。
+GMP 是一次职责拆分：G 是可以很多、可以睡的工作，M 是能被内核执行的线程，P 是跑 Go 代码的门票和本地缓存。队列分片为了不上全局锁，`runnext` 为了把「刚喊醒」当成一次函数调用，偷一半为了核别闲着，`handoffp` 为了线程卡住时门票继续转，`sysmon` 加 `SIGURG` 为了热循环和慢 syscall 停不住世界，netpoller 为了让「等网络」回到 park。
 
-**本地队列是性能，全局队列是公平。** 热路径尽量让 G 在同一张 P 上产生、消费、runnext 接力。观察延迟时如果看到工作在核之间乱跳，先想是不是把本该同步做完的一小段活，拆成了立刻 `go` 出去又马上要结果——那会故意丢掉 runnext 的局部性。
-
-**抢占保的是系统，不是你的尾延迟。** 10ms 时间片让 GC 和其它 G 有机会进来。一个 G 里连续 10ms 的纯计算，对调度器是正常的；对需要亚毫秒尾延迟的请求，是你把重活放错了地方。调度器不会因为某个请求更重要就给它更长的时间片——没有这套优先级。
-
-## 收住
-
-GMP 不是三张名词卡片，是一次职责拆分：
-
-- **G** 是工作：可以很多，可以睡，栈按需长
-- **M** 是能被内核执行的线程：可以比 P 多，多出来的那些通常卡在 syscall / cgo
-- **P** 是跑 Go 代码的门票和本地缓存：数量等于 `GOMAXPROCS`，决定真并行度
-
-队列分片是为了不上全局锁，runnext 是为了把「刚喊醒」当成函数调用，偷一半是为了核别闲着，`handoffp` 是为了线程卡住时门票继续转，`sysmon` 加信号是为了热循环和慢 syscall 不能把世界停住，netpoller 是为了让「等网络」回到 park，而不是回到一条线程。
-
-「goroutine 很轻」轻在创建和用户态切换。并发规模能上去，是因为**等 I/O 的 G 不占 P**。把这句话用反——用 goroutine 去占 CPU、去堵 syscall、去自旋——调度器还是会正确运转，只是账单会按线程和核来收，不再按「一次 `go` 很便宜」来收。
+- G 远多于 P 成立的前提是它们在**等**；一万个 `for { n++ }` 会把 P 吃满，尾延迟和 GC STW 一起上来。
+- 抢占保的是系统整体推进，不是你的尾延迟——调度器没有优先级，重活放错地方就只能自己承担。
+- 业务侧什么时候该停手不再 `go f()`，见 [Go 任务池：并发限制、排队与退出](/blog/2026/09/14/golang-worker-pool/)；取消和超时怎么往下传，见 [Go context：设计、源码与代价](/blog/2026/09/02/golang-context/)。

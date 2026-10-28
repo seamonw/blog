@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="100%" viewBox="0 0 800 390" role="img" aria-labelledby="title desc">
+  <title id="title">取消与执行权竞争的状态机</title>
+  <desc id="desc">任务依次从 PENDING、READY 到 RUNNING，运行结束进入 DONE。Cancel 可以竞争 PENDING 或 READY 到 CANCELLED 的原子转换。worker 成功从 READY 转换到 RUNNING 后取得唯一执行权，取消不再保证阻止执行。取消成功仍不等于对象已回收。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#b5d4f4" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="cancel-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#fac775" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+  <rect x="1" y="1" width="798" height="388" rx="16" fill="#141b25" stroke="#354356"/>
+  <g font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-weight="400">
+    <text x="32" y="37" fill="#e9eef5" font-size="18" font-weight="500">CAS 决定谁获得执行权，不决定对象何时回收</text>
+    <rect x="32" y="100" width="156" height="72" rx="9" fill="#0c447c" stroke="#85b7eb"/>
+    <rect x="226" y="100" width="156" height="72" rx="9" fill="#0c447c" stroke="#85b7eb"/>
+    <rect x="420" y="100" width="156" height="72" rx="9" fill="#0c447c" stroke="#85b7eb"/>
+    <rect x="614" y="100" width="154" height="72" rx="9" fill="#0c447c" stroke="#85b7eb"/>
+    <g text-anchor="middle" dominant-baseline="central">
+      <g fill="#e6f1fb" font-size="17" font-weight="500">
+        <text x="110" y="124">PENDING</text>
+        <text x="304" y="124">READY</text>
+        <text x="498" y="124">RUNNING</text>
+        <text x="691" y="124">DONE</text>
+      </g>
+      <g fill="#b5d4f4" font-size="13">
+        <text x="110" y="150">已接受，尚未就绪</text>
+        <text x="304" y="150">已获得就绪资格</text>
+        <text x="498" y="150">已取得执行权</text>
+        <text x="691" y="150">执行路径结束</text>
+      </g>
+    </g>
+    <path d="M188 136H220" fill="none" stroke="#b5d4f4" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <path d="M382 136H414" fill="none" stroke="#b5d4f4" stroke-width="2" marker-end="url(#arrow)"/>
+    <path d="M576 136H608" fill="none" stroke="#b5d4f4" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <g font-size="13" fill="#b5d4f4" text-anchor="middle">
+      <text x="206" y="80">owner CAS</text>
+      <text x="400" y="80">worker CAS</text>
+    </g>
+    <rect x="226" y="245" width="156" height="62" rx="9" fill="#633806" stroke="#ef9f27"/>
+    <g text-anchor="middle" dominant-baseline="central">
+      <text x="304" y="266" fill="#faeeda" font-size="17" font-weight="500">CANCELLED</text>
+      <text x="304" y="290" fill="#fac775" font-size="13">该次注册不再启动</text>
+    </g>
+    <path d="M110 172V276H220" fill="none" stroke="#fac775" stroke-width="1.5" marker-end="url(#cancel-arrow)"/>
+    <path d="M304 172V239" fill="none" stroke="#fac775" stroke-width="1.5" marker-end="url(#cancel-arrow)"/>
+    <g fill="#fac775" font-size="13">
+      <text x="119" y="232">Cancel CAS</text>
+      <text x="315" y="211">Cancel CAS</text>
+    </g>
+    <g fill="#d6e1ec" font-size="14">
+      <text x="430" y="254">worker CAS 先成功：</text>
+      <text x="430" y="279">即使尚未进入函数体，Cancel 也可失败。</text>
+    </g>
+    <path d="M32 329H768" fill="none" stroke="#354356"/>
+    <text x="400" y="362" text-anchor="middle" fill="#d6e1ec" font-size="14">取消执行权 ≠ 物理摘链 ≠ 等待回调结束 ≠ 对象回收</text>
+  </g>
+</svg>

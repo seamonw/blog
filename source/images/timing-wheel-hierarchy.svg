@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="100%" viewBox="0 0 800 290" role="img" aria-labelledby="title desc">
+  <title id="title">层级时间轮的降层路径</title>
+  <desc id="desc">每层八个槽，最低层粒度十毫秒。目标为第七十三个 tick 的任务，在 tick 零进入 L2 槽一，在 tick 六十四降到 L1 槽一，在 tick 七十二降到 L0 槽一，在 tick 七十三就绪。两次降层都不执行任务。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#b5d4f4" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+  <rect x="1" y="1" width="798" height="288" rx="16" fill="#141b25" stroke="#354356"/>
+  <g font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-weight="400">
+    <text x="32" y="37" fill="#e9eef5" font-size="18" font-weight="500">第 73 个 tick 到期：高层只搬迁，低层才到期</text>
+    <g font-size="14" fill="#b5d4f4" text-anchor="middle">
+      <text x="112" y="80">tick 0 · 0 ms</text>
+      <text x="304" y="80">tick 64 · 640 ms</text>
+      <text x="496" y="80">tick 72 · 720 ms</text>
+      <text x="688" y="80">tick 73 · 730 ms</text>
+    </g>
+    <rect x="32" y="99" width="160" height="75" rx="9" fill="#0c447c" stroke="#85b7eb" stroke-width="1"/>
+    <rect x="224" y="99" width="160" height="75" rx="9" fill="#0c447c" stroke="#85b7eb" stroke-width="1"/>
+    <rect x="416" y="99" width="160" height="75" rx="9" fill="#0c447c" stroke="#85b7eb" stroke-width="1"/>
+    <rect x="608" y="99" width="160" height="75" rx="9" fill="#085041" stroke="#5dcaa5" stroke-width="1"/>
+    <g text-anchor="middle" dominant-baseline="central">
+      <g font-size="17" font-weight="500" fill="#e6f1fb">
+        <text x="112" y="124">L2 · 槽 1</text>
+        <text x="304" y="124">L1 · 槽 1</text>
+        <text x="496" y="124">L0 · 槽 1</text>
+      </g>
+      <g font-size="13" fill="#b5d4f4">
+        <text x="112" y="151">粒度：64 tick</text>
+        <text x="304" y="151">粒度：8 tick</text>
+        <text x="496" y="151">粒度：1 tick</text>
+      </g>
+      <text x="688" y="124" fill="#e1f5ee" font-size="17" font-weight="500">进入就绪路径</text>
+      <text x="688" y="151" fill="#9fe1cb" font-size="13">执行仍需等待 worker</text>
+    </g>
+    <path d="M192 136H219" fill="none" stroke="#b5d4f4" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <path d="M384 136H411" fill="none" stroke="#b5d4f4" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <path d="M576 136H603" fill="none" stroke="#b5d4f4" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <g font-size="13" text-anchor="middle" fill="#b5d4f4">
+      <text x="304" y="199">剩余 9 tick，不执行</text>
+      <text x="496" y="199">剩余 1 tick，不执行</text>
+    </g>
+    <path d="M32 219H768" fill="none" stroke="#354356" stroke-width="1"/>
+    <text x="400" y="254" text-anchor="middle" fill="#d6e1ec" font-size="14">每层 8 槽 · tick = 10 ms · 原始目标 d = 73 始终不变</text>
+  </g>
+</svg>
